@@ -246,7 +246,7 @@ class ResolumeAgentClient:
         Sequential deck operations are fine; parallel calls on the same path
         are not supported.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_ack[path] = fut
         try:
@@ -369,7 +369,7 @@ class ResolumeAgentClient:
     async def rest_get(self, api_path: str) -> dict:
         """HTTP GET against the Resolume REST API (no WebSocket needed)."""
         url = f"http://{self._host}:{self._port}/api/v1{api_path}"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _fetch():
             with urllib.request.urlopen(url, timeout=5) as r:
@@ -458,12 +458,3 @@ class ResolumeAgentClient:
         """Return all available sources (clips, generators, live inputs)."""
         return await self.rest_get("/sources")
 
-
-if __name__ == "__main__":
-    async def main():
-        agent = ResolumeAgentClient()
-        if await agent.connect():
-            print("Connected. Decks:", len(agent.state.get("decks", [])))
-            await agent.disconnect()
-
-    asyncio.run(main())

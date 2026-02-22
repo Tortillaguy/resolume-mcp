@@ -5,25 +5,23 @@ Guidance for AI agents working on this codebase.
 ## Project Purpose
 
 Python package that exposes [Resolume Avenue/Arena](https://resolume.com) WebSocket
-control as MCP tools for Claude. Two servers ship in the package:
+control as MCP tools for any MCP-compatible AI agent. One server, two tools:
 
-| Server | Entry point | Tools |
-|---|---|---|
-| Code mode | `resolume-mcp-code` | `search`, `execute` |
-| Named tools | `resolume-mcp-tools` | 14 named tools |
+| Entry point | Tools |
+|---|---|
+| `resolume-mcp-code` | `search`, `execute` |
 
-Code mode is the preferred interface. Named-tools mode exists as a fallback for
-contexts where writing Python code is not appropriate.
+`search` introspects the live `ResolumeAgentClient` SDK and composition state.
+`execute` runs arbitrary Python against a connected client instance.
 
 ## Package Layout
 
 ```
 resolume_mcp/
-  config.py        ← DEFAULT_HOST/PORT/TIMEOUT, read from env vars
-  client.py        ← ResolumeAgentClient — all WebSocket/REST logic
-  code_server.py   ← search + execute MCP server
-  tools_server.py  ← 14 named-tool MCP server
-examples/          ← standalone SDK usage (no MCP)
+  config.py       ← DEFAULT_HOST/PORT/TIMEOUT, read from env vars
+  client.py       ← ResolumeAgentClient — all WebSocket/REST logic
+  code_server.py  ← search + execute MCP server
+examples/         ← standalone SDK usage (no MCP)
 ```
 
 No database, no file I/O, no external state. All state lives in `client.state`
@@ -34,9 +32,8 @@ No database, no file I/O, no external state. All state lives in `client.state`
 ```bash
 pip install -e .
 
-# Confirm entry points installed
+# Confirm entry point installed
 which resolume-mcp-code
-which resolume-mcp-tools
 ```
 
 ## Key Implementation Details
@@ -114,13 +111,9 @@ numeric ID from `client.state`, not the human-readable path. Resolume's WebSocke
 subscribe API requires by-id format; the path-based fallback is a best-effort
 alternative for when state hasn't loaded yet.
 
-## Adding a New Tool to tools_server.py
+## Adding a New SDK Method
 
-1. Add a `Tool(...)` entry in `list_tools()`
-2. Add a dispatch branch in `call_tool()`
-3. Add an `async def _tool_<name>()` implementation
-4. If it needs a new SDK operation, add the method to `client.py` first
-
-The named-tool server intentionally has no database or file dependencies — keep it
-that way. If a new tool would require local file paths, it belongs in the calling
-project's own MCP server, not here.
+1. Add the method to `client.py`
+2. It will automatically surface in `search()` results via introspection
+3. No changes to `code_server.py` needed — `execute()` runs arbitrary code against
+   the live client, so new methods are immediately usable

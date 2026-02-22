@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "resolume-mcp"
 version = "0.1.0"
-description = "MCP server for Claude to control Resolume Avenue/Arena via WebSocket"
+description = "MCP server for AI agents to control Resolume Avenue/Arena via WebSocket"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -15,5 +15,4 @@ dependencies = [
 ]
 
 [project.scripts]
-resolume-mcp-code  = "resolume_mcp.code_server:main_cli"
-resolume-mcp-tools = "resolume_mcp.tools_server:main_cli"
+resolume-mcp-code = "resolume_mcp.code_server:main_cli"
