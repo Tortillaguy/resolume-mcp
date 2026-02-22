@@ -353,10 +353,36 @@ class ResolumeAgentClient:
         await asyncio.gather(*[load_clip(i, p) for i, p in enumerate(clips_paths)])
         logger.info(f"Deck '{name}' bootstrapped at index {deck_index}")
 
-    async def add_video_effect(self, layer_index: int, effect_id: str):
-        """Adds a video effect to a layer."""
-        path = f"/composition/layers/{layer_index}/effects/video/add"
-        await self.send_command("post", path, effect_id)
+    async def add_video_effect(self, layer_index: int, effect_name: str, preset: str = None):
+        """Adds a video effect to a layer by effect name (e.g. "Strobe", "Blur").
+
+        Args:
+            layer_index: 1-based layer index.
+            effect_name: Display name of the effect as returned by list_effects()
+                         (e.g. "Strobe", "Blur", "Bloom"). NOT the idstring.
+            preset:      Optional preset name (e.g. "Solid", "Mosh Bump"). When
+                         provided the effect is added with that preset applied.
+
+        Bug fixed: the original implementation passed the idstring (e.g. "MSTX")
+        as the body. Resolume's WebSocket/REST add endpoint requires an effect URI:
+            "effect:///video/{effect_name}"            # no preset
+            "effect:///video/{effect_name}/{preset}"   # with preset
+        The idstring is only used by the GET /effects catalog endpoint.
+        The by-id layer path is used for robustness against layer reordering;
+        positional paths (/layers/{n}/effects/video/add) also work per the
+        official swagger spec at /api/docs/swagger.yaml.
+
+        Verified against Arena 7.23 via:
+        - Official example source: /rest/example/src/effects.tsx (drag URI format)
+        - Official swagger spec:   /rest/docs/swagger.yaml (endpoint + body shape)
+        """
+        layers = self.state.get("layers", [])
+        if layer_index < 1 or layer_index > len(layers):
+            raise ValueError(f"layer_index {layer_index} out of range (1-{len(layers)})")
+        layer_id = layers[layer_index - 1]["id"]
+        path = f"/composition/layers/by-id/{layer_id}/effects/video/add"
+        body = f"effect:///video/{effect_name}" if preset is None else f"effect:///video/{effect_name}/{preset}"
+        await self.send_command("post", path, body)
 
     async def set_parameter(self, path: str, value):
         """Sets any Resolume parameter by WebSocket path."""
