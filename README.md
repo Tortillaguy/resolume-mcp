@@ -120,15 +120,30 @@ search("opacity")
 
 ```python
 # "fade layer 1 out, connect clip 3, fade back in"
-await client.set_layer_opacity(1, 0.0)
-await client.connect_clip(1, 3)
-await client.set_layer_opacity(1, 1.0)
+await client.set_layer_opacity(layer_index=1, opacity=0.0)
+await client.connect_clip(layer_index=1, clip_index=3)
+await client.set_layer_opacity(layer_index=1, opacity=1.0)
 print("done")
 ```
 
 That entire sequence is one tool call. A traditional named-tool server would require
 three separate round-trips; `execute()` does it in one, and the agent can add
 conditional logic, loops, or timing between steps naturally.
+
+---
+
+## Quickstart prompt
+
+The server ships a built-in `quickstart` prompt — a self-contained VJ workflow guide
+that any MCP client can load to bootstrap context without needing this README.
+
+**Claude Desktop** — type `/` in the chat input and select `quickstart`.
+
+**Claude Code / other clients** — call `prompts/get` with `name: "quickstart"`, or
+ask your agent: *"load the quickstart prompt from the resolume-mcp server"*.
+
+The prompt covers the two-tool pattern, `client.state` structure quirks, layer/clip
+indexing, the async model, and five ready-to-run workflow examples.
 
 ---
 
