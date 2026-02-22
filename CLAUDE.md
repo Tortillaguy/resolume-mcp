@@ -117,3 +117,23 @@ alternative for when state hasn't loaded yet.
 2. It will automatically surface in `search()` results via introspection
 3. No changes to `code_server.py` needed — `execute()` runs arbitrary code against
    the live client, so new methods are immediately usable
+
+## MCP Prompt: `quickstart`
+
+`code_server.py` exposes a `quickstart` prompt via `list_prompts()` / `get_prompt()`.
+This is the primary self-documentation mechanism for agents using the server outside
+this repo (e.g. installed globally via `pip install resolume-mcp`).
+
+The prompt covers:
+- What Resolume is and what the server does
+- The `search` → `execute` two-tool pattern
+- The `client.state` no-`"composition"`-wrapper quirk
+- The async execution model (`await`, no `asyncio.run()`)
+- Five ready-to-run VJ workflow examples
+
+**Keep the prompt in sync when:**
+- Adding new SDK methods that change the recommended usage pattern
+- Discovering new `client.state` structural quirks
+- Changing the async execution model in `_run_user_code()`
+
+The prompt constant is `_QUICKSTART` at the top of `code_server.py` (module-level string).

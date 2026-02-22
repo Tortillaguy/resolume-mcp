@@ -20,10 +20,124 @@ import io
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import GetPromptResult, Prompt, PromptMessage, TextContent, Tool
 
 from resolume_mcp.client import ResolumeAgentClient
 from resolume_mcp.config import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# Prompt: portable quickstart documentation for AI agents
+# ---------------------------------------------------------------------------
+_QUICKSTART = """\
+## Resolume MCP: VJ Workflow Quickstart
+
+### What is this?
+
+[Resolume Avenue/Arena](https://resolume.com) is professional VJ software for live
+visual performance. This MCP server exposes its WebSocket/REST API to you via two
+tools: `search` and `execute`. You can fire clips, adjust layer opacity, set BPM,
+fade layers, add effects, and orchestrate multi-step VJ routines — all from a single
+`execute()` call.
+
+### Two-tool pattern
+
+1. **`search(query)`** — Discover what the SDK can do before writing code.
+   Returns matching `ResolumeAgentClient` method signatures + docstrings, and live
+   composition state paths (e.g. searching "bpm" shows the BPM state path and the
+   `set_bpm()` method signature).
+
+2. **`execute(code)`** — Run Python against the live client. `client` is pre-injected.
+   Use `await` for all async methods. Use `print()` to surface values.
+
+Always `search` first when you don't know the exact method name or state path.
+
+### client.state structure — critical quirk
+
+Resolume sends the composition as the bare root object. There is **no** `"composition"`
+wrapper key:
+
+```python
+# WRONG — "composition" key does not exist
+client.state["composition"]["layers"]  # KeyError
+
+# CORRECT — state IS the composition
+client.state["layers"]
+client.state["layers"][0]["name"]  # first layer name
+```
+
+### Async execution model
+
+All `execute()` code runs inside an existing asyncio event loop. Use `await` freely.
+Do NOT call `asyncio.run()` — it raises "cannot run nested event loop".
+
+---
+
+### Example: Read current state (BPM, layers, decks)
+
+```python
+layers = client.state.get("layers", [])
+tempo = client.state.get("tempocontroller", {})
+decks = client.state.get("decks", [])
+print(f"Layers: {len(layers)}")
+print(f"Decks: {len(decks)}")
+print(f"Tempo keys: {list(tempo.keys())}")
+```
+
+### Example: Fire a clip (layer 1, column 3)
+
+```python
+await client.connect_clip(layer=1, column=3)
+print("Clip fired")
+```
+
+### Example: Fade out → switch clip → fade in
+
+```python
+import asyncio
+
+# Fade layer 1 to 0 over ~500 ms
+for v in range(10, -1, -1):
+    await client.set_layer_opacity(layer=1, opacity=v / 10)
+    await asyncio.sleep(0.05)
+
+# Switch clip
+await client.connect_clip(layer=1, column=2)
+
+# Fade back in
+for v in range(0, 11):
+    await client.set_layer_opacity(layer=1, opacity=v / 10)
+    await asyncio.sleep(0.05)
+
+print("Crossfade complete")
+```
+
+### Example: Set BPM to 128
+
+```python
+await client.set_bpm(128)
+print("BPM set to 128")
+```
+
+### Example: Mute a layer and add a video effect
+
+```python
+await client.set_layer_bypass(layer=2, bypassed=True)
+print("Layer 2 bypassed")
+
+await client.add_video_effect(layer=1, effect_name="Blur")
+print("Blur added to layer 1")
+```
+
+---
+
+### Useful search queries to start
+
+- `search("layer")` — layer control methods + state paths
+- `search("clip")` — clip connect/disconnect
+- `search("bpm")` — tempo control
+- `search("opacity")` — opacity setters
+- `search("effect")` — video effect methods
+"""
 
 # ---------------------------------------------------------------------------
 # Shared client singleton (identical lifecycle to tools_server.py)
@@ -109,6 +223,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+
+@app.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    return [
+        Prompt(
+            name="quickstart",
+            description="VJ workflow guide — how to control Resolume live with this server",
+        )
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
+    if name != "quickstart":
+        raise ValueError(f"Unknown prompt: {name}")
+    return GetPromptResult(
+        description="Resolume MCP quickstart for VJ workflows",
+        messages=[
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=_QUICKSTART),
+            )
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
