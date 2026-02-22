@@ -51,10 +51,10 @@ fade layers, add effects, and orchestrate multi-step VJ routines — all from a 
 
 Always `search` first when you don't know the exact method name or state path.
 
-### client.state structure — critical quirk
+### client.state structure — two critical quirks
 
-Resolume sends the composition as the bare root object. There is **no** `"composition"`
-wrapper key:
+**1. No `"composition"` wrapper key.** Resolume sends the composition as the bare
+root object:
 
 ```python
 # WRONG — "composition" key does not exist
@@ -62,8 +62,25 @@ client.state["composition"]["layers"]  # KeyError
 
 # CORRECT — state IS the composition
 client.state["layers"]
-client.state["layers"][0]["name"]  # first layer name
 ```
+
+**2. All scalar values are dicts, not primitives.** Every parameter is wrapped:
+
+```python
+# WRONG
+client.state["layers"][0]["name"]           # returns {"value": "Layer #", ...}
+client.state["layers"][0]["bypassed"]       # returns {"value": False, ...}
+
+# CORRECT — always extract ["value"]
+client.state["layers"][0]["name"]["value"]       # "Layer #"
+client.state["layers"][0]["bypassed"]["value"]   # False
+```
+
+### Layer and clip indexing
+
+SDK methods use **1-based indexing** matching Resolume's UI (Layer 1 = first layer,
+Clip 1 = first slot). The `client.state["layers"]` list is 0-based in Python, so
+`client.state["layers"][0]` is "Layer 1" in the UI.
 
 ### Async execution model
 
@@ -76,17 +93,21 @@ Do NOT call `asyncio.run()` — it raises "cannot run nested event loop".
 
 ```python
 layers = client.state.get("layers", [])
-tempo = client.state.get("tempocontroller", {})
 decks = client.state.get("decks", [])
+bpm = client.state["tempocontroller"]["tempo"]["value"]
+print(f"BPM: {bpm}")
 print(f"Layers: {len(layers)}")
 print(f"Decks: {len(decks)}")
-print(f"Tempo keys: {list(tempo.keys())}")
+for i, layer in enumerate(layers):
+    name = layer["name"]["value"]
+    bypassed = layer["bypassed"]["value"]
+    print(f"  L{i+1}: {name!r} bypassed={bypassed}")
 ```
 
-### Example: Fire a clip (layer 1, column 3)
+### Example: Fire a clip (layer 1, clip slot 3)
 
 ```python
-await client.connect_clip(layer=1, column=3)
+await client.connect_clip(layer_index=1, clip_index=3)
 print("Clip fired")
 ```
 
@@ -97,15 +118,15 @@ import asyncio
 
 # Fade layer 1 to 0 over ~500 ms
 for v in range(10, -1, -1):
-    await client.set_layer_opacity(layer=1, opacity=v / 10)
+    await client.set_layer_opacity(layer_index=1, opacity=v / 10)
     await asyncio.sleep(0.05)
 
-# Switch clip
-await client.connect_clip(layer=1, column=2)
+# Switch to clip slot 2
+await client.connect_clip(layer_index=1, clip_index=2)
 
 # Fade back in
 for v in range(0, 11):
-    await client.set_layer_opacity(layer=1, opacity=v / 10)
+    await client.set_layer_opacity(layer_index=1, opacity=v / 10)
     await asyncio.sleep(0.05)
 
 print("Crossfade complete")
@@ -121,11 +142,12 @@ print("BPM set to 128")
 ### Example: Mute a layer and add a video effect
 
 ```python
-await client.set_layer_bypass(layer=2, bypassed=True)
+await client.set_layer_bypass(layer_index=2, bypassed=True)
 print("Layer 2 bypassed")
 
-await client.add_video_effect(layer=1, effect_name="Blur")
-print("Blur added to layer 1")
+# effect_id is an effect identifier string — use search("effect") to find valid IDs
+await client.add_video_effect(layer_index=1, effect_id="Blur")
+print("Effect added to layer 1")
 ```
 
 ---
