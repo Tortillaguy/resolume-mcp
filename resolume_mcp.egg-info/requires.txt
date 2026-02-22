@@ -1,2 +1,0 @@
-mcp>=1.0
-websockets>=13.0
