@@ -1,0 +1,3 @@
+[console_scripts]
+resolume-mcp-code = resolume_mcp.code_server:main_cli
+resolume-mcp-tools = resolume_mcp.tools_server:main_cli

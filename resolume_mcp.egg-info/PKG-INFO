@@ -1,0 +1,154 @@
+Metadata-Version: 2.4
+Name: resolume-mcp
+Version: 0.1.0
+Summary: MCP server for Claude to control Resolume Avenue/Arena via WebSocket
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: mcp>=1.0
+Requires-Dist: websockets>=13.0
+Dynamic: license-file
+
+# resolume-mcp
+
+Control [Resolume Avenue/Arena](https://resolume.com) from Claude using the Model Context Protocol (MCP). Tell Claude to fire a clip, fade a layer, change BPM, or write multi-step VJ sequences — and it happens live.
+
+Two servers ship in this package. Pick one:
+
+- **Code mode** (`resolume-mcp-code`) — Claude writes Python against a live client. Best for multi-step operations (fade out → switch clip → fade in) in a single call.
+- **Tools mode** (`resolume-mcp-tools`) — 14 named tools, one per operation. Best for simple, discrete commands.
+
+---
+
+## Prerequisites
+
+- **Resolume Avenue or Arena ≥ 7** with the WebSocket server enabled
+- **Python ≥ 3.11**
+
+### Enable Resolume's WebSocket server
+
+1. Open Resolume → **Preferences** → **WebServer**
+2. Enable the server (default port: `8080`)
+3. Note the IP address if Claude is running on a different machine
+
+---
+
+## Install
+
+```bash
+pip install git+https://github.com/cachorueda/resolume-mcp.git
+```
+
+Or clone and install in editable mode:
+
+```bash
+git clone https://github.com/cachorueda/resolume-mcp.git
+pip install -e resolume-mcp/
+```
+
+---
+
+## Claude Desktop config
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "resolume-code": {
+      "command": "resolume-mcp-code",
+      "env": { "RESOLUME_HOST": "192.168.0.77" }
+    }
+  }
+}
+```
+
+Omit the `env` block entirely if Resolume runs on the same machine as Claude (defaults to `localhost`).
+
+---
+
+## Claude Code config
+
+Add to `.mcp.json` in your project root (or `~/.claude/.mcp.json` for global use):
+
+```json
+{
+  "mcpServers": {
+    "resolume-code": {
+      "command": "resolume-mcp-code",
+      "env": { "RESOLUME_HOST": "192.168.0.77" }
+    }
+  }
+}
+```
+
+---
+
+## Tools: code mode
+
+Code mode exposes two tools: `search` and `execute`.
+
+**`search(query)`** — discover what the SDK can do and inspect live state paths:
+
+```
+search("opacity")
+→ client.set_layer_opacity(self, layer_index: int, opacity: float)
+    → Set layer opacity (0.0 = invisible, 1.0 = full)
+
+  state/layers/0/video/opacity  (value=1.0)
+```
+
+**`execute(code)`** — run Python against the live Resolume client. `client` is pre-injected:
+
+```python
+# Fade out layer 1, switch clip, fade back in — one call
+await client.set_layer_opacity(1, 0.0)
+await client.connect_clip(1, 3)
+await client.set_layer_opacity(1, 1.0)
+print("done")
+```
+
+This is the code-mode advantage: a three-step operation that would require three tool calls in tools mode becomes one `execute()` call with no intermediate round-trips.
+
+---
+
+## Tools: named-tool mode
+
+Switch to `resolume-mcp-tools` in your MCP config for discrete named tools:
+
+| Tool | Description |
+|---|---|
+| `get_composition` | Summary of decks, layers, and connected clips |
+| `connect_clip` | Trigger a clip cell to play |
+| `connect_column` | Fire all clips in a column simultaneously |
+| `disconnect_all` | Stop all clips (blackout) |
+| `set_layer_opacity` | Fade a layer in or out (0.0–1.0) |
+| `set_layer_bypass` | Mute or unmute a layer |
+| `get_bpm` | Read current tempo from live state |
+| `set_bpm` | Change global composition tempo |
+| `set_crossfader` | Move A/B crossfader (0.0–1.0) |
+| `add_video_effect` | Add a video effect to a layer |
+| `set_parameter` | Set any parameter by WebSocket path |
+| `send_command` | Raw WebSocket command (low-level escape hatch) |
+| `list_effects` | Browse available effects with their IDs |
+| `list_sources` | Browse available sources grouped by type |
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `RESOLUME_HOST` | `localhost` | IP or hostname of the Resolume machine |
+| `RESOLUME_PORT` | `8080` | WebSocket server port |
+| `RESOLUME_TIMEOUT` | `10.0` | Connection timeout in seconds |
+
+---
+
+## Examples
+
+See [`examples/`](examples/) for standalone scripts that use `ResolumeAgentClient` directly without MCP:
+
+- [`basic_connection.py`](examples/basic_connection.py) — connect, read BPM, disconnect
+- [`fade_and_switch.py`](examples/fade_and_switch.py) — fade out, switch clip, fade in
