@@ -27,9 +27,16 @@ from resolume_mcp.client import ResolumeAgentClient
 from resolume_mcp.config import BEHAVIORS_PATH, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT, SNAPSHOTS_DIR
 from resolume_mcp.snapshots import (
     SnapshotStore,
+    extract_clip_effects,
+    extract_crossfader,
+    extract_deck,
     extract_layer_effects,
+    extract_layer_group,
     extract_layer_settings,
+    restore_clip_effects,
+    restore_crossfader,
     restore_layer_effects,
+    restore_layer_group,
     restore_layer_settings,
 )
 
@@ -197,7 +204,7 @@ async def get_behavior_manager() -> BehaviorManager:
     global _behavior_manager
     if _behavior_manager is None:
         client = await get_client()
-        _behavior_manager = BehaviorManager(client, BEHAVIORS_PATH)
+        _behavior_manager = BehaviorManager(client, BEHAVIORS_PATH, snapshot_store=_snapshot_store)
         await _behavior_manager.start()
     return _behavior_manager
 
@@ -303,7 +310,7 @@ async def list_tools() -> list[Tool]:
                         "type": "object",
                         "description": (
                             "What to do. {type, params}. "
-                            "type: set_parameter|toggle_parameter|toggle_parameters|set_parameters"
+                            "type: set_parameter|toggle_parameter|toggle_parameters|set_parameters|restore_snapshot"
                         ),
                         "properties": {
                             "type": {"type": "string"},
@@ -319,9 +326,9 @@ async def list_tools() -> list[Tool]:
             name="snapshots",
             description=(
                 "Save and restore Resolume composition state slices. "
-                "Capture effects and settings from a layer, then restore them "
-                "to the same or different layer/composition. "
-                "Snapshots match by effect name, not ID, so they work across compositions. "
+                "Capture effects, settings, crossfader, decks, layer groups, or clip presets, "
+                "then restore them to the same or different target. "
+                "Snapshots match by name (not ID), so they work across compositions. "
                 "Subcommands: save, load, list, delete, show."
             ),
             inputSchema={
@@ -338,12 +345,27 @@ async def list_tools() -> list[Tool]:
                     },
                     "snapshot_type": {
                         "type": "string",
-                        "enum": ["layer_effects", "layer_settings"],
-                        "description": "What to capture (for save) or restore (for load). Default: layer_effects",
+                        "enum": [
+                            "layer_effects", "layer_settings", "clip_effects",
+                            "crossfader", "deck", "layer_group",
+                        ],
+                        "description": "What to capture (for save). Default: layer_effects",
                     },
                     "layer_index": {
                         "type": "integer",
-                        "description": "1-based layer index to snapshot from (save) or restore to (load)",
+                        "description": "1-based layer index (for layer_effects, layer_settings, clip_effects)",
+                    },
+                    "clip_index": {
+                        "type": "integer",
+                        "description": "1-based clip index (for clip_effects)",
+                    },
+                    "deck_index": {
+                        "type": "integer",
+                        "description": "1-based deck index (for deck)",
+                    },
+                    "group_index": {
+                        "type": "integer",
+                        "description": "1-based layer group index (for layer_group)",
                     },
                 },
                 "required": ["subcommand"],
@@ -577,23 +599,43 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
         name = arguments.get("name")
         if not name:
             return [TextContent(type="text", text="Error: 'name' is required for save")]
-        layer_index = arguments.get("layer_index")
-        if not layer_index:
-            return [TextContent(type="text", text="Error: 'layer_index' is required for save")]
         snap_type = arguments.get("snapshot_type", "layer_effects")
+        layer_index = arguments.get("layer_index")
+        clip_index = arguments.get("clip_index")
+        deck_index = arguments.get("deck_index")
+        group_index = arguments.get("group_index")
+
+        if snap_type in ("layer_effects", "layer_settings", "clip_effects") and not layer_index:
+            return [TextContent(type="text", text="Error: 'layer_index' is required for this snapshot type")]
 
         if snap_type == "layer_effects":
             data = extract_layer_effects(client.state, layer_index)
         elif snap_type == "layer_settings":
             data = extract_layer_settings(client.state, layer_index)
+        elif snap_type == "clip_effects":
+            if not clip_index:
+                return [TextContent(type="text", text="Error: 'clip_index' is required for clip_effects")]
+            data = extract_clip_effects(client.state, layer_index, clip_index)
+        elif snap_type == "crossfader":
+            data = extract_crossfader(client.state)
+        elif snap_type == "deck":
+            if not deck_index:
+                return [TextContent(type="text", text="Error: 'deck_index' is required for deck")]
+            data = extract_deck(client.state, deck_index)
+        elif snap_type == "layer_group":
+            if not group_index:
+                return [TextContent(type="text", text="Error: 'group_index' is required for layer_group")]
+            data = extract_layer_group(client.state, group_index)
         else:
             return [TextContent(type="text", text=f"Unknown snapshot_type: {snap_type}")]
 
-        result = _snapshot_store.save(name, snap_type, data)
+        _snapshot_store.save(name, snap_type, data)
         summary = f"Saved snapshot {name!r} ({snap_type})"
-        if snap_type == "layer_effects":
-            n_fx = len(data.get("effects", []))
-            summary += f" — {n_fx} effects from L{layer_index} {data.get('layer_name', '')!r}"
+        if "effects" in data:
+            n_fx = len(data["effects"])
+            summary += f" — {n_fx} effects"
+        if data.get("layer_name"):
+            summary += f" from {data['layer_name']!r}"
         return [TextContent(type="text", text=summary)]
 
     elif sub == "load":
@@ -601,9 +643,6 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
         name = arguments.get("name")
         if not name:
             return [TextContent(type="text", text="Error: 'name' is required for load")]
-        layer_index = arguments.get("layer_index")
-        if not layer_index:
-            return [TextContent(type="text", text="Error: 'layer_index' is required for load")]
 
         snap = _snapshot_store.load(name)
         if snap is None:
@@ -611,8 +650,13 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
 
         snap_type = snap.get("type", "")
         data = snap.get("data", {})
+        layer_index = arguments.get("layer_index")
+        clip_index = arguments.get("clip_index")
+        group_index = arguments.get("group_index")
 
         if snap_type == "layer_effects":
+            if not layer_index:
+                return [TextContent(type="text", text="Error: 'layer_index' is required for loading layer_effects")]
             result = await restore_layer_effects(client, data, layer_index)
             applied = result["applied"]
             skipped = result["skipped"]
@@ -624,10 +668,49 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif snap_type == "layer_settings":
+            if not layer_index:
+                return [TextContent(type="text", text="Error: 'layer_index' is required for loading layer_settings")]
             result = await restore_layer_settings(client, data, layer_index)
             return [TextContent(
                 type="text",
                 text=f"Restored {name!r} settings to L{layer_index}: {result['params_set']} params set",
+            )]
+
+        elif snap_type == "clip_effects":
+            if not layer_index:
+                return [TextContent(type="text", text="Error: 'layer_index' is required for loading clip_effects")]
+            if not clip_index:
+                return [TextContent(type="text", text="Error: 'clip_index' is required for loading clip_effects")]
+            result = await restore_clip_effects(client, data, layer_index, clip_index)
+            applied = result["applied"]
+            skipped = result["skipped"]
+            lines = [f"Restored {name!r} to L{layer_index} C{clip_index}:"]
+            for a in applied:
+                lines.append(f"  {a['effect']}: {a['params_set']} params set")
+            if skipped:
+                lines.append(f"  Skipped (not in target): {', '.join(skipped)}")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif snap_type == "crossfader":
+            result = await restore_crossfader(client, data)
+            return [TextContent(
+                type="text",
+                text=f"Restored crossfader from {name!r}: {result['params_set']} params set",
+            )]
+
+        elif snap_type == "layer_group":
+            if not group_index:
+                return [TextContent(type="text", text="Error: 'group_index' is required for loading layer_group")]
+            result = await restore_layer_group(client, data, group_index)
+            return [TextContent(
+                type="text",
+                text=f"Restored {name!r} to group {group_index}: {result['params_set']} params set",
+            )]
+
+        elif snap_type == "deck":
+            return [TextContent(
+                type="text",
+                text=f"Deck snapshots are read-only references (name/color). Use 'show' to view.",
             )]
 
         else:
@@ -640,21 +723,36 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
         snap = _snapshot_store.load(name)
         if snap is None:
             return [TextContent(type="text", text=f"Snapshot {name!r} not found")]
-        # Pretty-print the snapshot data (without full JSON dump noise)
         data = snap.get("data", {})
-        lines = [f"Snapshot: {name} ({snap.get('type', '')})"]
-        lines.append(f"Created: {snap.get('created', '')}")
-        lines.append(f"Layer: {data.get('layer_name', '')} (index {data.get('layer_index', '?')})")
+        snap_type = snap.get("type", "")
+        lines = [f"Snapshot: {name} ({snap_type})", f"Created: {snap.get('created', '')}"]
+
+        if data.get("layer_name"):
+            lines.append(f"Layer: {data['layer_name']} (index {data.get('layer_index', '?')})")
+        if data.get("clip_name"):
+            lines.append(f"Clip: {data['clip_name']} (index {data.get('clip_index', '?')})")
+
         if "effects" in data:
             lines.append(f"Effects ({len(data['effects'])}):")
             for fx in data["effects"]:
                 bp = f", bypassed={fx['bypassed']}" if "bypassed" in fx else ""
                 n_params = len(fx.get("params", {}))
                 lines.append(f"  {fx['name']}{bp}, {n_params} params")
+
         for key in ("bypassed", "solo", "master", "video_opacity", "crossfadergroup",
-                     "maskmode", "ignorecolumntrigger", "faderstart"):
-            if key in data:
+                     "maskmode", "ignorecolumntrigger", "faderstart", "phase",
+                     "behaviour", "curve", "colorid", "name"):
+            if key in data and key != "name" or (key == "name" and snap_type == "deck"):
                 lines.append(f"  {key}: {data[key]}")
+
+        if "mixer" in data:
+            lines.append("  mixer:")
+            for pname, pval in data["mixer"].items():
+                lines.append(f"    {pname}: {pval.get('value', '?')}")
+
+        if "layer_names" in data:
+            lines.append(f"  layers: {', '.join(data['layer_names'])}")
+
         return [TextContent(type="text", text="\n".join(lines))]
 
     elif sub == "delete":

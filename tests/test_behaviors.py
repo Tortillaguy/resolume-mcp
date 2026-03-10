@@ -254,3 +254,97 @@ def test_find_param_value_by_id_not_found(client, persist_path):
     client.state = {}
     result = mgr._find_param_value_by_id(client.state, 999)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# restore_snapshot action
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_action(client, persist_path, tmp_path):
+    """A behavior with restore_snapshot action loads and applies a snapshot."""
+    from resolume_mcp.snapshots import SnapshotStore
+
+    await client.connect()
+    client.state = {
+        "layers": [
+            {
+                "id": 1,
+                "name": {"value": "L1", "id": 10},
+                "bypassed": {"value": False, "id": 11, "valuetype": "ParamBoolean"},
+                "solo": {"value": False, "id": 12, "valuetype": "ParamBoolean"},
+                "master": {"value": 1.0, "id": 13, "valuetype": "ParamRange"},
+                "video": {
+                    "opacity": {"value": 1.0, "id": 20, "valuetype": "ParamRange"},
+                    "effects": [
+                        {
+                            "id": 100,
+                            "name": "Blur",
+                            "params": {
+                                "Amount": {"id": 101, "value": 0.0, "valuetype": "ParamRange"},
+                            },
+                        },
+                    ],
+                },
+                "clips": [],
+            }
+        ],
+    }
+
+    store = SnapshotStore(str(tmp_path / "snaps"))
+    store.save("my-fx", "layer_effects", {
+        "layer_index": 1,
+        "effects": [
+            {"name": "Blur", "params": {"Amount": {"value": 0.8, "valuetype": "ParamRange"}}},
+        ],
+    })
+
+    mgr = BehaviorManager(client, persist_path, snapshot_store=store)
+    b = Behavior(
+        name="restore-on-trigger",
+        trigger_param_id=11,
+        condition=Condition(op="any"),
+        action=Action(type="restore_snapshot", params={"name": "my-fx", "layer_index": 1}),
+    )
+    await mgr.add(b)
+    # Manually execute the action
+    await mgr._execute_action(b, True)
+    # No exception means success (dry_run client logs the SET calls)
+    await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_no_store(client, persist_path):
+    """restore_snapshot without a snapshot store raises ValueError."""
+    await client.connect()
+    mgr = BehaviorManager(client, persist_path, snapshot_store=None)
+    b = Behavior(
+        name="no-store",
+        trigger_param_id=11,
+        condition=Condition(op="any"),
+        action=Action(type="restore_snapshot", params={"name": "test"}),
+    )
+    await mgr.add(b)
+    with pytest.raises(ValueError, match="No snapshot store"):
+        await mgr._execute_action(b, True)
+    await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_not_found(client, persist_path, tmp_path):
+    """restore_snapshot with a missing snapshot raises ValueError."""
+    from resolume_mcp.snapshots import SnapshotStore
+
+    await client.connect()
+    store = SnapshotStore(str(tmp_path / "snaps"))
+    mgr = BehaviorManager(client, persist_path, snapshot_store=store)
+    b = Behavior(
+        name="missing-snap",
+        trigger_param_id=11,
+        condition=Condition(op="any"),
+        action=Action(type="restore_snapshot", params={"name": "nonexistent"}),
+    )
+    await mgr.add(b)
+    with pytest.raises(ValueError, match="not found"):
+        await mgr._execute_action(b, True)
+    await mgr.stop()

@@ -100,9 +100,10 @@ def _behavior_from_dict(d: dict) -> Behavior:
 
 class BehaviorManager:
 
-    def __init__(self, client: ResolumeAgentClient, persist_path: str):
+    def __init__(self, client: ResolumeAgentClient, persist_path: str, snapshot_store=None):
         self._client = client
         self._persist_path = persist_path
+        self._snapshot_store = snapshot_store  # Optional SnapshotStore for restore_snapshot action
         self._behaviors: dict[str, Behavior] = {}  # id → Behavior
 
     # --- CRUD ---
@@ -242,6 +243,42 @@ class BehaviorManager:
         elif action.type == "set_parameters":
             for p in action.params.get("parameters", []):
                 await self._client.send_command("set", p["path"], p["value"])
+
+        elif action.type == "restore_snapshot":
+            if self._snapshot_store is None:
+                raise ValueError("No snapshot store configured")
+            from resolume_mcp.snapshots import (
+                restore_clip_effects, restore_crossfader, restore_layer_effects,
+                restore_layer_group, restore_layer_settings,
+            )
+            snap_name = action.params.get("name")
+            if not snap_name:
+                raise ValueError("restore_snapshot requires 'name' in params")
+            snap = self._snapshot_store.load(snap_name)
+            if snap is None:
+                raise ValueError(f"Snapshot {snap_name!r} not found")
+            snap_type = snap.get("type", "")
+            data = snap.get("data", {})
+            target_layer = action.params.get("layer_index")
+            target_clip = action.params.get("clip_index")
+            target_group = action.params.get("group_index")
+
+            if snap_type == "layer_effects":
+                await restore_layer_effects(self._client, data, target_layer or data.get("layer_index", 1))
+            elif snap_type == "layer_settings":
+                await restore_layer_settings(self._client, data, target_layer or data.get("layer_index", 1))
+            elif snap_type == "clip_effects":
+                await restore_clip_effects(
+                    self._client, data,
+                    target_layer or data.get("layer_index", 1),
+                    target_clip or data.get("clip_index", 1),
+                )
+            elif snap_type == "crossfader":
+                await restore_crossfader(self._client, data)
+            elif snap_type == "layer_group":
+                await restore_layer_group(self._client, data, target_group or data.get("group_index", 1))
+            else:
+                raise ValueError(f"Cannot restore snapshot type: {snap_type}")
 
         else:
             raise ValueError(f"Unknown action type: {action.type}")

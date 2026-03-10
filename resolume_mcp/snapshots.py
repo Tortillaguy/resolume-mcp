@@ -67,6 +67,17 @@ def _extract_effect(effect: dict) -> dict:
     return out
 
 
+def _extract_params_dict(params: dict) -> dict:
+    """Extract all params from a dict of name→param_dict, stripping IDs."""
+    extracted = {}
+    if isinstance(params, dict):
+        for pname, pval in params.items():
+            p = _extract_param(pval)
+            if p is not None:
+                extracted[pname] = p
+    return extracted
+
+
 def extract_layer_effects(state: dict, layer_index: int) -> dict:
     """Snapshot all video effects on a layer (1-based index).
 
@@ -105,6 +116,89 @@ def extract_layer_settings(state: dict, layer_index: int) -> dict:
     if isinstance(opacity, dict) and "value" in opacity:
         settings["video_opacity"] = opacity["value"]
     return settings
+
+
+def extract_clip_effects(state: dict, layer_index: int, clip_index: int) -> dict:
+    """Snapshot all video effects on a specific clip (1-based indices).
+
+    Returns effect list with param values — portable across compositions.
+    """
+    layers = state.get("layers", [])
+    if layer_index < 1 or layer_index > len(layers):
+        raise ValueError(f"layer_index {layer_index} out of range (1-{len(layers)})")
+    layer = layers[layer_index - 1]
+    clips = layer.get("clips", [])
+    if clip_index < 1 or clip_index > len(clips):
+        raise ValueError(f"clip_index {clip_index} out of range (1-{len(clips)})")
+    clip = clips[clip_index - 1]
+    video = clip.get("video")
+    effects = video.get("effects", []) if isinstance(video, dict) else []
+    return {
+        "layer_index": layer_index,
+        "layer_name": layer.get("name", {}).get("value", ""),
+        "clip_index": clip_index,
+        "clip_name": clip.get("name", {}).get("value", ""),
+        "effects": [_extract_effect(fx) for fx in effects] if isinstance(effects, list) else [],
+    }
+
+
+def extract_crossfader(state: dict) -> dict:
+    """Snapshot the crossfader settings (phase, behaviour, curve, mixer)."""
+    cf = state.get("crossfader", {})
+    out: dict[str, Any] = {}
+    for key in ("phase", "behaviour", "curve"):
+        param = cf.get(key)
+        if isinstance(param, dict) and "value" in param:
+            out[key] = param["value"]
+    mixer = cf.get("mixer")
+    if isinstance(mixer, dict):
+        out["mixer"] = _extract_params_dict(mixer)
+    return out
+
+
+def extract_deck(state: dict, deck_index: int) -> dict:
+    """Snapshot a deck's metadata (1-based index).
+
+    Captures deck name, color, and the names of clips in each layer/column
+    position. Does NOT capture clip content (that's tied to file paths).
+    """
+    decks = state.get("decks", [])
+    if deck_index < 1 or deck_index > len(decks):
+        raise ValueError(f"deck_index {deck_index} out of range (1-{len(decks)})")
+    deck = decks[deck_index - 1]
+    out: dict[str, Any] = {
+        "deck_index": deck_index,
+        "name": deck.get("name", {}).get("value", ""),
+    }
+    colorid = deck.get("colorid")
+    if isinstance(colorid, dict) and "value" in colorid:
+        out["colorid"] = colorid["value"]
+    return out
+
+
+def extract_layer_group(state: dict, group_index: int) -> dict:
+    """Snapshot a layer group's settings (1-based index)."""
+    groups = state.get("layergroups", [])
+    if group_index < 1 or group_index > len(groups):
+        raise ValueError(f"group_index {group_index} out of range (1-{len(groups)})")
+    group = groups[group_index - 1]
+    out: dict[str, Any] = {
+        "group_index": group_index,
+        "name": group.get("name", {}).get("value", ""),
+    }
+    for key in ("bypassed", "solo", "master", "crossfadergroup",
+                "ignorecolumntrigger"):
+        param = group.get(key)
+        if isinstance(param, dict) and "value" in param:
+            out[key] = param["value"]
+    # Capture which layer indices are in the group
+    layers_in_group = group.get("layers", [])
+    if isinstance(layers_in_group, list):
+        out["layer_names"] = [
+            l.get("name", {}).get("value", "") for l in layers_in_group
+            if isinstance(l, dict)
+        ]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +316,129 @@ async def restore_layer_settings(
         param_id = _find_param_id(opacity_param)
         if param_id:
             await client.send_command("set", f"/parameter/by-id/{param_id}", snapshot["video_opacity"])
+            params_set += 1
+
+    return {"params_set": params_set}
+
+
+async def restore_clip_effects(
+    client: ResolumeAgentClient,
+    snapshot: dict,
+    target_layer_index: int,
+    target_clip_index: int,
+) -> dict:
+    """Restore effect parameters from a clip snapshot to a target clip.
+
+    Same name-matching logic as restore_layer_effects.
+    """
+    layers = client.state.get("layers", [])
+    if target_layer_index < 1 or target_layer_index > len(layers):
+        raise ValueError(f"target_layer_index {target_layer_index} out of range (1-{len(layers)})")
+    target_layer = layers[target_layer_index - 1]
+    clips = target_layer.get("clips", [])
+    if target_clip_index < 1 or target_clip_index > len(clips):
+        raise ValueError(f"target_clip_index {target_clip_index} out of range (1-{len(clips)})")
+    target_clip = clips[target_clip_index - 1]
+
+    video = target_clip.get("video")
+    live_effects = video.get("effects", []) if isinstance(video, dict) else []
+    if not isinstance(live_effects, list):
+        live_effects = []
+
+    live_by_name: dict[str, dict] = {}
+    for fx in live_effects:
+        name = fx.get("name", "")
+        if name:
+            live_by_name[name] = fx
+
+    applied = []
+    skipped = []
+
+    for snap_fx in snapshot.get("effects", []):
+        fx_name = snap_fx.get("name", "")
+        live_fx = live_by_name.get(fx_name)
+        if live_fx is None:
+            skipped.append(fx_name)
+            continue
+
+        fx_applied = {"effect": fx_name, "params_set": 0}
+
+        if "bypassed" in snap_fx and live_fx.get("bypassed"):
+            param_id = _find_param_id(live_fx["bypassed"])
+            if param_id:
+                await client.send_command("set", f"/parameter/by-id/{param_id}", snap_fx["bypassed"])
+                fx_applied["params_set"] += 1
+
+        for pname, psnap in snap_fx.get("params", {}).items():
+            live_params = live_fx.get("params", {})
+            live_p = live_params.get(pname) if isinstance(live_params, dict) else None
+            if live_p is None:
+                continue
+            param_id = _find_param_id(live_p)
+            if param_id:
+                await client.send_command("set", f"/parameter/by-id/{param_id}", psnap["value"])
+                fx_applied["params_set"] += 1
+
+        for pname, psnap in snap_fx.get("mixer", {}).items():
+            live_mixer = live_fx.get("mixer", {})
+            live_p = live_mixer.get(pname) if isinstance(live_mixer, dict) else None
+            if live_p is None:
+                continue
+            param_id = _find_param_id(live_p)
+            if param_id:
+                await client.send_command("set", f"/parameter/by-id/{param_id}", psnap["value"])
+                fx_applied["params_set"] += 1
+
+        applied.append(fx_applied)
+
+    return {"applied": applied, "skipped": skipped}
+
+
+async def restore_crossfader(client: ResolumeAgentClient, snapshot: dict) -> dict:
+    """Restore crossfader settings from a snapshot."""
+    cf = client.state.get("crossfader", {})
+    params_set = 0
+
+    for key in ("phase", "behaviour", "curve"):
+        if key not in snapshot:
+            continue
+        live_param = cf.get(key)
+        param_id = _find_param_id(live_param)
+        if param_id:
+            await client.send_command("set", f"/parameter/by-id/{param_id}", snapshot[key])
+            params_set += 1
+
+    for pname, psnap in snapshot.get("mixer", {}).items():
+        live_mixer = cf.get("mixer", {})
+        live_p = live_mixer.get(pname) if isinstance(live_mixer, dict) else None
+        param_id = _find_param_id(live_p) if live_p else None
+        if param_id:
+            await client.send_command("set", f"/parameter/by-id/{param_id}", psnap["value"])
+            params_set += 1
+
+    return {"params_set": params_set}
+
+
+async def restore_layer_group(
+    client: ResolumeAgentClient,
+    snapshot: dict,
+    target_group_index: int,
+) -> dict:
+    """Restore layer group settings from a snapshot."""
+    groups = client.state.get("layergroups", [])
+    if target_group_index < 1 or target_group_index > len(groups):
+        raise ValueError(f"target_group_index {target_group_index} out of range (1-{len(groups)})")
+    target = groups[target_group_index - 1]
+    params_set = 0
+
+    for key in ("bypassed", "solo", "master", "crossfadergroup",
+                "ignorecolumntrigger"):
+        if key not in snapshot:
+            continue
+        live_param = target.get(key)
+        param_id = _find_param_id(live_param)
+        if param_id:
+            await client.send_command("set", f"/parameter/by-id/{param_id}", snapshot[key])
             params_set += 1
 
     return {"params_set": params_set}
