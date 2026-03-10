@@ -37,6 +37,11 @@ class ResolumeAgentClient:
         self._subscriptions: set[str] = set()               # re-subscribed after reconnect
         self._max_reconnect_attempts = max_reconnect_attempts
 
+        # Live caches updated via WebSocket push (no REST polling needed)
+        self.sources: dict = {}   # updated by "sources_update" messages
+        self.effects: dict = {}   # updated by "effects_update" messages
+        self._parameter_callbacks: dict[int, list] = {}  # id → [callback, ...]
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -73,7 +78,7 @@ class ResolumeAgentClient:
 
     async def _do_connect(self):
         """Open the WebSocket and start the listener task."""
-        self.ws = await websockets.connect(self.uri)
+        self.ws = await websockets.connect(self.uri, max_size=None)
         logger.info(f"Connected to Resolume at {self.uri}")
         self._listen_task = asyncio.create_task(self._listen())
 
@@ -86,6 +91,7 @@ class ResolumeAgentClient:
         for fut in self._pending_ack.values():
             fut.cancel()
         self._pending_ack.clear()
+        self._parameter_callbacks.clear()
         if self.ws:
             await self.ws.close()
             self.ws = None
@@ -97,30 +103,69 @@ class ResolumeAgentClient:
     # ------------------------------------------------------------------
 
     async def _listen(self):
-        """Receive and process all messages from Resolume."""
+        """Receive and process all messages from Resolume.
+
+        Message dispatch follows the same pattern as Resolume's official
+        example app (/rest/example):
+
+        1. No "type" field + has "columns" & "layers" → full composition state
+        2. type: "parameter_get/set/update/subscribed" → parameter by-id update
+        3. type: "sources_update" → sources catalog changed
+        4. type: "effects_update" → effects catalog changed
+        5. type: "thumbnail_update" → clip thumbnail changed
+        6. Legacy: "path" + "value" (no type) → incremental state patch
+        """
         try:
             async for raw in self.ws:
                 data = json.loads(raw)
+                msg_type = data.get("type")
 
-                if "decks" in data or "layers" in data:
-                    # Full state replacement — Resolume sends the composition
-                    # as the bare root object (no "composition" wrapper key)
-                    self.state = data
-                    self._state_ready.set()
-                    logger.debug("Full state received from Resolume")
-                    # Resolve any pending ACKs whose path now exists
-                    self._resolve_acks_from_state()
+                if msg_type is None or not isinstance(msg_type, str):
+                    # No type field — check for composition state or legacy update
+                    if "columns" in data and "layers" in data:
+                        self.state = data
+                        self._state_ready.set()
+                        logger.debug("Full state received from Resolume")
+                        self._resolve_acks_from_state()
+                    elif "path" in data and "value" in data:
+                        path: str = data["path"]
+                        value = data["value"]
+                        self._apply_incremental_update(path, value)
+                        if path in self._pending_ack:
+                            fut = self._pending_ack.pop(path)
+                            if not fut.done():
+                                fut.set_result(value)
+                    else:
+                        logger.debug(f"Unrecognized message (no type): {list(data.keys())}")
 
-                elif "path" in data and "value" in data:
-                    # Incremental update — walk the state tree and patch the leaf
-                    path: str = data["path"]
-                    value = data["value"]
-                    self._apply_incremental_update(path, value)
-                    # Resolve ACK for this exact path if one is waiting
-                    if path in self._pending_ack:
-                        fut = self._pending_ack.pop(path)
-                        if not fut.done():
-                            fut.set_result(value)
+                elif msg_type in ("parameter_get", "parameter_set",
+                                  "parameter_update", "parameter_subscribed"):
+                    param_id = data.get("id")
+                    value = data.get("value")
+                    if isinstance(param_id, int) and value is not None:
+                        # Dispatch to parameter callbacks
+                        for cb in self._parameter_callbacks.get(param_id, []):
+                            cb(data)
+                        # Resolve pending ACK by by-id path
+                        ack_path = f"/parameter/by-id/{param_id}"
+                        if ack_path in self._pending_ack:
+                            fut = self._pending_ack.pop(ack_path)
+                            if not fut.done():
+                                fut.set_result(value)
+
+                elif msg_type == "sources_update":
+                    self.sources = data.get("value", {})
+                    logger.debug("Sources catalog updated via WebSocket")
+
+                elif msg_type == "effects_update":
+                    self.effects = data.get("value", {})
+                    logger.debug("Effects catalog updated via WebSocket")
+
+                elif msg_type == "thumbnail_update":
+                    self._apply_thumbnail_update(data.get("value", {}))
+
+                else:
+                    logger.debug(f"Unhandled message type: {msg_type}")
 
         except ConnectionClosed:
             logger.warning("Resolume WebSocket connection closed")
@@ -160,6 +205,17 @@ class ResolumeAgentClient:
                 node["value"] = value
         except (KeyError, IndexError, TypeError):
             logger.debug(f"Ignoring incremental update for unknown path: {path}")
+
+    def _apply_thumbnail_update(self, thumb: dict):
+        """Patch a clip's thumbnail in state when Resolume pushes an update."""
+        thumb_id = thumb.get("id")
+        if thumb_id is None:
+            return
+        for layer in self.state.get("layers", []):
+            for clip in layer.get("clips", []):
+                if clip.get("id") == thumb_id:
+                    clip["thumbnail"] = thumb
+                    return
 
     def _resolve_acks_from_state(self):
         """After a full state replacement, resolve any pending ACKs."""
@@ -204,7 +260,7 @@ class ResolumeAgentClient:
 
         Resolume's WebSocket API uses two distinct payload shapes:
           - post / remove  → {"action": ..., "path": ..., "body": ...}
-          - get / set / subscribe / unsubscribe / trigger
+          - get / set / subscribe / unsubscribe / trigger / reset
                            → {"action": ..., "parameter": ..., "value": ...}
         """
         if self.dry_run:
@@ -294,6 +350,50 @@ class ResolumeAgentClient:
         ws_path = f"/parameter/by-id/{param_id}" if param_id else path
         self._subscriptions.discard(ws_path)
         await self.send_command("unsubscribe", ws_path)
+
+    # ------------------------------------------------------------------
+    # Parameter monitoring (matches Resolume example app pattern)
+    # ------------------------------------------------------------------
+
+    async def monitor_parameter(self, param_id: int, callback) -> None:
+        """Subscribe to a parameter by numeric ID and register a callback.
+
+        The callback receives the full message dict:
+        {"type": "parameter_update", "id": 123, "value": 0.5, ...}
+
+        If this is the first monitor for this ID, a WebSocket subscribe is sent.
+        Subsequent monitors for the same ID reuse the existing subscription.
+        """
+        path = f"/parameter/by-id/{param_id}"
+        if param_id not in self._parameter_callbacks:
+            self._parameter_callbacks[param_id] = [callback]
+            self._subscriptions.add(path)
+            await self.send_command("subscribe", path)
+        else:
+            self._parameter_callbacks[param_id].append(callback)
+
+    async def unmonitor_parameter(self, param_id: int, callback) -> None:
+        """Remove a callback for a parameter. Unsubscribes when no callbacks remain."""
+        cbs = self._parameter_callbacks.get(param_id)
+        if cbs is None:
+            return
+        try:
+            cbs.remove(callback)
+        except ValueError:
+            return
+        if not cbs:
+            del self._parameter_callbacks[param_id]
+            path = f"/parameter/by-id/{param_id}"
+            self._subscriptions.discard(path)
+            await self.send_command("unsubscribe", path)
+
+    async def reset_parameter(self, param_id: int, reset_animation: bool = False):
+        """Reset a parameter to its default value by numeric ID.
+
+        Matches the official REST endpoint: /parameter/by-id/{id}/reset
+        The WebSocket action "reset" achieves the same over WS.
+        """
+        await self.send_command("reset", f"/parameter/by-id/{param_id}")
 
     # ------------------------------------------------------------------
     # High-level agent operations
@@ -477,10 +577,22 @@ class ResolumeAgentClient:
     # ------------------------------------------------------------------
 
     async def list_effects(self) -> dict:
-        """Return all available video/audio effects from the REST API."""
-        return await self.rest_get("/effects")
+        """Return all available video/audio effects.
+
+        Uses the live WebSocket cache (populated by effects_update messages)
+        when available, falling back to a REST call on first use.
+        """
+        if not self.effects:
+            self.effects = await self.rest_get("/effects")
+        return self.effects
 
     async def list_sources(self) -> dict:
-        """Return all available sources (clips, generators, live inputs)."""
-        return await self.rest_get("/sources")
+        """Return all available sources (clips, generators, live inputs).
+
+        Uses the live WebSocket cache (populated by sources_update messages)
+        when available, falling back to a REST call on first use.
+        """
+        if not self.sources:
+            self.sources = await self.rest_get("/sources")
+        return self.sources
 
