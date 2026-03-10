@@ -7,6 +7,10 @@ BEHAVIORS_PATH = os.environ.get(
     "RESOLUME_BEHAVIORS_PATH",
     os.path.join(os.path.expanduser("~"), ".resolume-mcp", "behaviors.json"),
 )
+SNAPSHOTS_DIR = os.environ.get(
+    "RESOLUME_SNAPSHOTS_DIR",
+    os.path.join(os.path.expanduser("~"), ".resolume-mcp", "snapshots"),
+)
 
 
 def get_ws_uri(host=DEFAULT_HOST, port=DEFAULT_PORT) -> str:

@@ -24,7 +24,14 @@ from mcp.types import GetPromptResult, Prompt, PromptMessage, TextContent, Tool
 
 from resolume_mcp.behaviors import Action, Behavior, BehaviorManager, Condition
 from resolume_mcp.client import ResolumeAgentClient
-from resolume_mcp.config import BEHAVIORS_PATH, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
+from resolume_mcp.config import BEHAVIORS_PATH, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT, SNAPSHOTS_DIR
+from resolume_mcp.snapshots import (
+    SnapshotStore,
+    extract_layer_effects,
+    extract_layer_settings,
+    restore_layer_effects,
+    restore_layer_settings,
+)
 
 # ---------------------------------------------------------------------------
 # Prompt: portable quickstart documentation for AI agents
@@ -195,6 +202,9 @@ async def get_behavior_manager() -> BehaviorManager:
     return _behavior_manager
 
 
+_snapshot_store = SnapshotStore(SNAPSHOTS_DIR)
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -305,6 +315,40 @@ async def list_tools() -> list[Tool]:
                 "required": ["subcommand"],
             },
         ),
+        Tool(
+            name="snapshots",
+            description=(
+                "Save and restore Resolume composition state slices. "
+                "Capture effects and settings from a layer, then restore them "
+                "to the same or different layer/composition. "
+                "Snapshots match by effect name, not ID, so they work across compositions. "
+                "Subcommands: save, load, list, delete, show."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subcommand": {
+                        "type": "string",
+                        "enum": ["save", "load", "list", "delete", "show"],
+                        "description": "Operation to perform",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Snapshot name (for save/load/delete/show)",
+                    },
+                    "snapshot_type": {
+                        "type": "string",
+                        "enum": ["layer_effects", "layer_settings"],
+                        "description": "What to capture (for save) or restore (for load). Default: layer_effects",
+                    },
+                    "layer_index": {
+                        "type": "integer",
+                        "description": "1-based layer index to snapshot from (save) or restore to (load)",
+                    },
+                },
+                "required": ["subcommand"],
+            },
+        ),
     ]
 
 
@@ -317,6 +361,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await _tool_execute(arguments["code"])
         elif name == "behaviors":
             return await _tool_behaviors(arguments)
+        elif name == "snapshots":
+            return await _tool_snapshots(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -507,6 +553,117 @@ async def _tool_behaviors(arguments: dict) -> list[TextContent]:
         if ok:
             return [TextContent(type="text", text=f"Disabled behavior {arguments['id']}")]
         return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
+
+    else:
+        return [TextContent(type="text", text=f"Unknown subcommand: {sub}")]
+
+
+async def _tool_snapshots(arguments: dict) -> list[TextContent]:
+    sub = arguments["subcommand"]
+
+    if sub == "list":
+        items = _snapshot_store.list()
+        if not items:
+            return [TextContent(type="text", text="No snapshots saved.")]
+        lines = []
+        for s in items:
+            lines.append(
+                f"{s['name']} ({s['type']}) — {s.get('layer_name', '')} L{s.get('layer_index', '?')} [{s['created']}]"
+            )
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif sub == "save":
+        client = await get_client()
+        name = arguments.get("name")
+        if not name:
+            return [TextContent(type="text", text="Error: 'name' is required for save")]
+        layer_index = arguments.get("layer_index")
+        if not layer_index:
+            return [TextContent(type="text", text="Error: 'layer_index' is required for save")]
+        snap_type = arguments.get("snapshot_type", "layer_effects")
+
+        if snap_type == "layer_effects":
+            data = extract_layer_effects(client.state, layer_index)
+        elif snap_type == "layer_settings":
+            data = extract_layer_settings(client.state, layer_index)
+        else:
+            return [TextContent(type="text", text=f"Unknown snapshot_type: {snap_type}")]
+
+        result = _snapshot_store.save(name, snap_type, data)
+        summary = f"Saved snapshot {name!r} ({snap_type})"
+        if snap_type == "layer_effects":
+            n_fx = len(data.get("effects", []))
+            summary += f" — {n_fx} effects from L{layer_index} {data.get('layer_name', '')!r}"
+        return [TextContent(type="text", text=summary)]
+
+    elif sub == "load":
+        client = await get_client()
+        name = arguments.get("name")
+        if not name:
+            return [TextContent(type="text", text="Error: 'name' is required for load")]
+        layer_index = arguments.get("layer_index")
+        if not layer_index:
+            return [TextContent(type="text", text="Error: 'layer_index' is required for load")]
+
+        snap = _snapshot_store.load(name)
+        if snap is None:
+            return [TextContent(type="text", text=f"Snapshot {name!r} not found")]
+
+        snap_type = snap.get("type", "")
+        data = snap.get("data", {})
+
+        if snap_type == "layer_effects":
+            result = await restore_layer_effects(client, data, layer_index)
+            applied = result["applied"]
+            skipped = result["skipped"]
+            lines = [f"Restored {name!r} to L{layer_index}:"]
+            for a in applied:
+                lines.append(f"  {a['effect']}: {a['params_set']} params set")
+            if skipped:
+                lines.append(f"  Skipped (not in target): {', '.join(skipped)}")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif snap_type == "layer_settings":
+            result = await restore_layer_settings(client, data, layer_index)
+            return [TextContent(
+                type="text",
+                text=f"Restored {name!r} settings to L{layer_index}: {result['params_set']} params set",
+            )]
+
+        else:
+            return [TextContent(type="text", text=f"Unknown snapshot type: {snap_type}")]
+
+    elif sub == "show":
+        name = arguments.get("name")
+        if not name:
+            return [TextContent(type="text", text="Error: 'name' is required for show")]
+        snap = _snapshot_store.load(name)
+        if snap is None:
+            return [TextContent(type="text", text=f"Snapshot {name!r} not found")]
+        # Pretty-print the snapshot data (without full JSON dump noise)
+        data = snap.get("data", {})
+        lines = [f"Snapshot: {name} ({snap.get('type', '')})"]
+        lines.append(f"Created: {snap.get('created', '')}")
+        lines.append(f"Layer: {data.get('layer_name', '')} (index {data.get('layer_index', '?')})")
+        if "effects" in data:
+            lines.append(f"Effects ({len(data['effects'])}):")
+            for fx in data["effects"]:
+                bp = f", bypassed={fx['bypassed']}" if "bypassed" in fx else ""
+                n_params = len(fx.get("params", {}))
+                lines.append(f"  {fx['name']}{bp}, {n_params} params")
+        for key in ("bypassed", "solo", "master", "video_opacity", "crossfadergroup",
+                     "maskmode", "ignorecolumntrigger", "faderstart"):
+            if key in data:
+                lines.append(f"  {key}: {data[key]}")
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif sub == "delete":
+        name = arguments.get("name")
+        if not name:
+            return [TextContent(type="text", text="Error: 'name' is required for delete")]
+        if _snapshot_store.delete(name):
+            return [TextContent(type="text", text=f"Deleted snapshot {name!r}")]
+        return [TextContent(type="text", text=f"Snapshot {name!r} not found")]
 
     else:
         return [TextContent(type="text", text=f"Unknown subcommand: {sub}")]
