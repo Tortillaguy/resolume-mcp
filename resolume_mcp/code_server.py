@@ -22,8 +22,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import GetPromptResult, Prompt, PromptMessage, TextContent, Tool
 
+from resolume_mcp.behaviors import Action, Behavior, BehaviorManager, Condition
 from resolume_mcp.client import ResolumeAgentClient
-from resolume_mcp.config import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
+from resolume_mcp.config import BEHAVIORS_PATH, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Prompt: portable quickstart documentation for AI agents
@@ -181,6 +182,19 @@ async def get_client() -> ResolumeAgentClient:
     return _client
 
 
+_behavior_manager: BehaviorManager | None = None
+
+
+async def get_behavior_manager() -> BehaviorManager:
+    """Return the shared behavior manager, creating and starting on first call."""
+    global _behavior_manager
+    if _behavior_manager is None:
+        client = await get_client()
+        _behavior_manager = BehaviorManager(client, BEHAVIORS_PATH)
+        await _behavior_manager.start()
+    return _behavior_manager
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -231,6 +245,66 @@ async def list_tools() -> list[Tool]:
                 "required": ["code"],
             },
         ),
+        Tool(
+            name="behaviors",
+            description=(
+                "Manage persistent reactive behaviors. A behavior monitors a Resolume "
+                "parameter and performs an action when a condition is met. "
+                "Behaviors survive server restarts. "
+                "Subcommands: list, add, remove, enable, disable."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subcommand": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove", "enable", "disable"],
+                        "description": "Operation to perform",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Behavior ID (for remove/enable/disable)",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Human-readable name (for add)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional description (for add)",
+                    },
+                    "trigger_param_id": {
+                        "type": "integer",
+                        "description": "Numeric parameter ID to monitor (for add). Use search to find IDs.",
+                    },
+                    "condition": {
+                        "type": "object",
+                        "description": (
+                            "When to fire. {op, value?}. "
+                            "op: any|eq|neq|gt|lt|gte|lte|truthy|falsy"
+                        ),
+                        "properties": {
+                            "op": {"type": "string"},
+                            "value": {},
+                        },
+                        "required": ["op"],
+                    },
+                    "action": {
+                        "type": "object",
+                        "description": (
+                            "What to do. {type, params}. "
+                            "type: set_parameter|toggle_parameter|toggle_parameters|set_parameters"
+                        ),
+                        "properties": {
+                            "type": {"type": "string"},
+                            "params": {"type": "object"},
+                        },
+                        "required": ["type", "params"],
+                    },
+                },
+                "required": ["subcommand"],
+            },
+        ),
     ]
 
 
@@ -241,6 +315,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return await _tool_search(arguments["query"])
         elif name == "execute":
             return await _tool_execute(arguments["code"])
+        elif name == "behaviors":
+            return await _tool_behaviors(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -382,6 +458,58 @@ async def _tool_execute(code: str) -> list[TextContent]:
         parts.append(f"→ {result!r}")
 
     return [TextContent(type="text", text="\n".join(parts) or "(no output)")]
+
+
+async def _tool_behaviors(arguments: dict) -> list[TextContent]:
+    mgr = await get_behavior_manager()
+    sub = arguments["subcommand"]
+
+    if sub == "list":
+        items = mgr.list()
+        if not items:
+            return [TextContent(type="text", text="No behaviors registered.")]
+        lines = []
+        for b in items:
+            status = "ON" if b["enabled"] else "OFF"
+            fires = b.get("fire_count", 0)
+            err = b.get("last_error")
+            line = f"[{status}] {b['name']} (id={b['id']}, trigger={b['trigger_param_id']}, fires={fires})"
+            if err:
+                line += f"\n  last_error: {err}"
+            lines.append(line)
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif sub == "add":
+        b = Behavior(
+            name=arguments.get("name", "Untitled"),
+            description=arguments.get("description", ""),
+            trigger_param_id=arguments["trigger_param_id"],
+            condition=Condition(**arguments.get("condition", {"op": "any"})),
+            action=Action(**arguments["action"]),
+        )
+        result = await mgr.add(b)
+        return [TextContent(type="text", text=f"Added behavior {result.name!r} (id={result.id})")]
+
+    elif sub == "remove":
+        ok = await mgr.remove(arguments["id"])
+        if ok:
+            return [TextContent(type="text", text=f"Removed behavior {arguments['id']}")]
+        return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
+
+    elif sub == "enable":
+        ok = await mgr.enable(arguments["id"])
+        if ok:
+            return [TextContent(type="text", text=f"Enabled behavior {arguments['id']}")]
+        return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
+
+    elif sub == "disable":
+        ok = await mgr.disable(arguments["id"])
+        if ok:
+            return [TextContent(type="text", text=f"Disabled behavior {arguments['id']}")]
+        return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
+
+    else:
+        return [TextContent(type="text", text=f"Unknown subcommand: {sub}")]
 
 
 # ---------------------------------------------------------------------------

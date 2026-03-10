@@ -1,0 +1,305 @@
+"""
+Behavior engine for Resolume MCP
+---------------------------------
+Named, persistent reactive rules: when a parameter changes and a condition
+is met, perform a declarative action. Survives server restarts via JSON file.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import uuid
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from resolume_mcp.client import ResolumeAgentClient
+
+logger = logging.getLogger("ResolumeAgent.behaviors")
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Condition:
+    op: str = "any"       # any|eq|neq|gt|lt|gte|lte|truthy|falsy
+    value: Any = None     # comparison operand (ignored for any/truthy/falsy)
+
+
+@dataclass
+class Action:
+    type: str = ""                               # set_parameter|toggle_parameter|set_parameters
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Behavior:
+    id: str = ""
+    name: str = ""
+    trigger_param_id: int = 0
+    condition: Condition = field(default_factory=Condition)
+    action: Action = field(default_factory=Action)
+    enabled: bool = True
+    description: str = ""
+    # Runtime-only (not persisted)
+    fire_count: int = field(default=0, repr=False)
+    last_error: str | None = field(default=None, repr=False)
+    _callback: Any = field(default=None, repr=False)
+
+
+_RUNTIME_FIELDS = {"fire_count", "last_error", "_callback"}
+
+_CONDITION_OPS = {
+    "any":    lambda v, _: True,
+    "truthy": lambda v, _: bool(v),
+    "falsy":  lambda v, _: not bool(v),
+    "eq":     lambda v, c: v == c,
+    "neq":    lambda v, c: v != c,
+    "gt":     lambda v, c: v > c,
+    "lt":     lambda v, c: v < c,
+    "gte":    lambda v, c: v >= c,
+    "lte":    lambda v, c: v <= c,
+}
+
+
+def check_condition(cond: Condition, value: Any) -> bool:
+    fn = _CONDITION_OPS.get(cond.op)
+    if fn is None:
+        return False
+    try:
+        return fn(value, cond.value)
+    except (TypeError, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+def _behavior_to_dict(b: Behavior) -> dict:
+    d = asdict(b)
+    for k in _RUNTIME_FIELDS:
+        d.pop(k, None)
+    return d
+
+
+def _behavior_from_dict(d: dict) -> Behavior:
+    cond = Condition(**d.pop("condition", {}))
+    action = Action(**d.pop("action", {}))
+    d.pop("fire_count", None)
+    d.pop("last_error", None)
+    d.pop("_callback", None)
+    return Behavior(condition=cond, action=action, **d)
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
+
+class BehaviorManager:
+
+    def __init__(self, client: ResolumeAgentClient, persist_path: str):
+        self._client = client
+        self._persist_path = persist_path
+        self._behaviors: dict[str, Behavior] = {}  # id → Behavior
+
+    # --- CRUD ---
+
+    async def add(self, behavior: Behavior) -> Behavior:
+        if not behavior.id:
+            behavior.id = uuid.uuid4().hex[:12]
+        self._behaviors[behavior.id] = behavior
+        if behavior.enabled:
+            await self._activate(behavior)
+        self._persist()
+        return behavior
+
+    async def remove(self, behavior_id: str) -> bool:
+        b = self._behaviors.pop(behavior_id, None)
+        if b is None:
+            return False
+        await self._deactivate(b)
+        self._persist()
+        return True
+
+    async def enable(self, behavior_id: str) -> bool:
+        b = self._behaviors.get(behavior_id)
+        if b is None:
+            return False
+        b.enabled = True
+        await self._activate(b)
+        self._persist()
+        return True
+
+    async def disable(self, behavior_id: str) -> bool:
+        b = self._behaviors.get(behavior_id)
+        if b is None:
+            return False
+        b.enabled = False
+        await self._deactivate(b)
+        self._persist()
+        return True
+
+    def list(self) -> list[dict]:
+        results = []
+        for b in self._behaviors.values():
+            d = _behavior_to_dict(b)
+            d["fire_count"] = b.fire_count
+            d["last_error"] = b.last_error
+            results.append(d)
+        return results
+
+    def get(self, behavior_id: str) -> Behavior | None:
+        return self._behaviors.get(behavior_id)
+
+    # --- Lifecycle ---
+
+    async def start(self) -> None:
+        for b in self._load():
+            self._behaviors[b.id] = b
+            if b.enabled:
+                await self._activate(b)
+        if self._behaviors:
+            logger.info(f"Loaded {len(self._behaviors)} behaviors ({sum(1 for b in self._behaviors.values() if b.enabled)} enabled)")
+
+    async def stop(self) -> None:
+        for b in self._behaviors.values():
+            await self._deactivate(b)
+
+    # --- Activation ---
+
+    async def _activate(self, b: Behavior) -> None:
+        if b._callback is not None:
+            return  # already active
+        cb = self._make_callback(b)
+        b._callback = cb
+        await self._client.monitor_parameter(b.trigger_param_id, cb)
+
+    async def _deactivate(self, b: Behavior) -> None:
+        if b._callback is None:
+            return
+        await self._client.unmonitor_parameter(b.trigger_param_id, b._callback)
+        b._callback = None
+
+    def _make_callback(self, behavior: Behavior):
+        def _on_change(data: dict):
+            if not behavior.enabled:
+                return
+            value = data.get("value")
+            if not check_condition(behavior.condition, value):
+                return
+            behavior.fire_count += 1
+            loop = asyncio.get_event_loop()
+            task = loop.create_task(self._execute_action(behavior, value))
+            task.add_done_callback(lambda t: self._handle_task_result(behavior, t))
+        return _on_change
+
+    def _handle_task_result(self, behavior: Behavior, task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            behavior.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(f"Behavior {behavior.name!r} action failed: {behavior.last_error}")
+        else:
+            behavior.last_error = None
+
+    # --- Action execution ---
+
+    async def _execute_action(self, behavior: Behavior, trigger_value: Any) -> None:
+        action = behavior.action
+
+        if action.type == "set_parameter":
+            path = action.params["path"]
+            value = action.params["value"]
+            await self._client.send_command("set", path, value)
+
+        elif action.type == "toggle_parameter":
+            path = action.params["path"]
+            # Read current value from state by walking by-id
+            current = self._read_param_value(path)
+            if isinstance(current, bool):
+                await self._client.send_command("set", path, not current)
+            elif isinstance(current, (int, float)):
+                await self._client.send_command("set", path, 1 - current)
+            else:
+                # Fallback: try boolean toggle
+                await self._client.send_command("set", path, not current)
+
+        elif action.type == "toggle_parameters":
+            for p in action.params.get("parameters", []):
+                path = p["path"]
+                current = self._read_param_value(path)
+                if isinstance(current, bool):
+                    await self._client.send_command("set", path, not current)
+                elif isinstance(current, (int, float)):
+                    await self._client.send_command("set", path, 1 - current)
+                else:
+                    await self._client.send_command("set", path, not current)
+
+        elif action.type == "set_parameters":
+            for p in action.params.get("parameters", []):
+                await self._client.send_command("set", p["path"], p["value"])
+
+        else:
+            raise ValueError(f"Unknown action type: {action.type}")
+
+    def _read_param_value(self, path: str) -> Any:
+        """Read a parameter's current value from client state.
+
+        Handles /parameter/by-id/{id} paths by scanning the state tree
+        for a dict with matching id, then returning its 'value' field.
+        """
+        if path.startswith("/parameter/by-id/"):
+            try:
+                param_id = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return None
+            return self._find_param_value_by_id(self._client.state, param_id)
+        return None
+
+    def _find_param_value_by_id(self, node: Any, param_id: int, max_depth: int = 10) -> Any:
+        """Recursively search state for a parameter dict with matching id."""
+        if max_depth <= 0:
+            return None
+        if isinstance(node, dict):
+            if node.get("id") == param_id and "value" in node:
+                return node["value"]
+            for v in node.values():
+                result = self._find_param_value_by_id(v, param_id, max_depth - 1)
+                if result is not None:
+                    return result
+        elif isinstance(node, list):
+            for item in node:
+                result = self._find_param_value_by_id(item, param_id, max_depth - 1)
+                if result is not None:
+                    return result
+        return None
+
+    # --- Persistence ---
+
+    def _persist(self) -> None:
+        dirpath = os.path.dirname(self._persist_path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        data = {
+            "version": 1,
+            "behaviors": [_behavior_to_dict(b) for b in self._behaviors.values()],
+        }
+        tmp = self._persist_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, self._persist_path)
+
+    def _load(self) -> list[Behavior]:
+        if not os.path.exists(self._persist_path):
+            return []
+        try:
+            with open(self._persist_path) as f:
+                data = json.load(f)
+            return [_behavior_from_dict(d) for d in data.get("behaviors", [])]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f"Failed to load behaviors from {self._persist_path}: {e}")
+            return []
