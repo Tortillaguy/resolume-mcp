@@ -98,6 +98,126 @@ def _behavior_from_dict(d: dict) -> Behavior:
 # Manager
 # ---------------------------------------------------------------------------
 
+class DashboardNamingWatcher:
+    """Watches for new dashboard bindings named 'Opacity' and renames them.
+
+    When an effect's Opacity parameter is bound to a dashboard knob the knob
+    inherits the generic label "Opacity", which is ambiguous when multiple
+    effects are on the same layer/clip. This watcher detects the binding
+    event (a structural change in a dashboard ParameterCollection) and
+    renames the knob to the display name of the effect that owns the parameter.
+
+    Rename mechanism: ``remove`` the old key + ``post`` under the new name.
+    Both are standard WebSocket ``post``/``remove`` actions (path+body format),
+    the same pattern used for adding effects or opening clips.
+
+    Scopes watched: composition dashboard, every layer dashboard, every clip
+    dashboard — all can have parameters bound to them.
+    """
+
+    def __init__(self, client: ResolumeAgentClient):
+        self._client = client
+        # Maps scope_key → frozenset of dashboard param names seen last update
+        self._prev_keys: dict[str, frozenset] = {}
+        self._enabled = True
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def start(self) -> None:
+        self._client.add_state_listener(self._on_state)
+
+    def stop(self) -> None:
+        self._client.remove_state_listener(self._on_state)
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def _on_state(self, state: dict) -> None:
+        if not self._enabled:
+            return
+        scopes = self._collect_scopes(state)
+        for scope_key, ws_path, dashboard in scopes:
+            self._check(state, scope_key, ws_path, dashboard)
+
+    def _collect_scopes(self, state: dict):
+        """Yield (scope_key, ws_path, dashboard_dict) for every dashboard in state."""
+        yield "composition", "/composition", state.get("dashboard", {})
+        for i, layer in enumerate(state.get("layers", [])):
+            yield f"layer_{i+1}", f"/composition/layers/{i+1}", layer.get("dashboard", {})
+            for j, clip in enumerate(layer.get("clips", [])):
+                yield (
+                    f"clip_{i+1}_{j+1}",
+                    f"/composition/layers/{i+1}/clips/{j+1}",
+                    clip.get("dashboard", {}),
+                )
+
+    def _check(self, state: dict, scope_key: str, ws_path: str, dashboard: dict) -> None:
+        if not isinstance(dashboard, dict):
+            return
+        current = frozenset(dashboard.keys())
+        prev = self._prev_keys.get(scope_key, frozenset())
+        self._prev_keys[scope_key] = current
+
+        for key in current - prev:
+            if key.lower() == "opacity":
+                entry = dashboard[key]
+                param_id = entry.get("id") if isinstance(entry, dict) else None
+                if not param_id:
+                    continue
+                effect_name = self._find_effect_name(state, param_id)
+                if effect_name and effect_name.lower() != "opacity":
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(
+                        self._rename(ws_path, key, effect_name, entry)
+                    )
+                    logger.info(
+                        f"Dashboard binding: renaming {key!r} → {effect_name!r} at {ws_path}"
+                    )
+
+    def _find_effect_name(self, state: dict, param_id: int) -> str | None:
+        """Scan all effects in state for one whose params include this ID."""
+        for layer in state.get("layers", []):
+            name = self._scan_effects(layer.get("video", {}).get("effects", []), param_id)
+            if name:
+                return name
+            for clip in layer.get("clips", []):
+                video = clip.get("video")
+                fx_list = video.get("effects", []) if isinstance(video, dict) else []
+                name = self._scan_effects(fx_list, param_id)
+                if name:
+                    return name
+        return None
+
+    def _scan_effects(self, effects: list, param_id: int) -> str | None:
+        for fx in effects:
+            if not isinstance(fx, dict):
+                continue
+            for pval in (fx.get("params") or {}).values():
+                if isinstance(pval, dict) and pval.get("id") == param_id:
+                    return fx.get("display_name") or fx.get("name") or ""
+            for pval in (fx.get("mixer") or {}).values():
+                if isinstance(pval, dict) and pval.get("id") == param_id:
+                    return fx.get("display_name") or fx.get("name") or ""
+        return None
+
+    async def _rename(self, ws_path: str, old_key: str, new_key: str, entry: dict) -> None:
+        """Remove the old dashboard key and post it under the new name."""
+        try:
+            await self._client.send_command(
+                "remove", f"{ws_path}/dashboard/{old_key}"
+            )
+            await self._client.send_command(
+                "post", f"{ws_path}/dashboard/{new_key}", entry
+            )
+        except Exception as e:
+            logger.warning(f"Dashboard rename {old_key!r} → {new_key!r} failed: {e}")
+
+
 class BehaviorManager:
 
     def __init__(self, client: ResolumeAgentClient, persist_path: str, snapshot_store=None):
@@ -105,6 +225,7 @@ class BehaviorManager:
         self._persist_path = persist_path
         self._snapshot_store = snapshot_store  # Optional SnapshotStore for restore_snapshot action
         self._behaviors: dict[str, Behavior] = {}  # id → Behavior
+        self.dashboard_naming = DashboardNamingWatcher(client)
 
     # --- CRUD ---
 
@@ -158,6 +279,7 @@ class BehaviorManager:
     # --- Lifecycle ---
 
     async def start(self) -> None:
+        self.dashboard_naming.start()
         for b in self._load():
             self._behaviors[b.id] = b
             if b.enabled:
@@ -166,6 +288,7 @@ class BehaviorManager:
             logger.info(f"Loaded {len(self._behaviors)} behaviors ({sum(1 for b in self._behaviors.values() if b.enabled)} enabled)")
 
     async def stop(self) -> None:
+        self.dashboard_naming.stop()
         for b in self._behaviors.values():
             await self._deactivate(b)
 

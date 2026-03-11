@@ -41,6 +41,7 @@ class ResolumeAgentClient:
         self.sources: dict = {}   # updated by "sources_update" messages
         self.effects: dict = {}   # updated by "effects_update" messages
         self._parameter_callbacks: dict[int, list] = {}  # id → [callback, ...]
+        self._state_listeners: list = []  # called on every full state replacement
 
     # ------------------------------------------------------------------
     # Connection management
@@ -127,6 +128,11 @@ class ResolumeAgentClient:
                         self._state_ready.set()
                         logger.debug("Full state received from Resolume")
                         self._resolve_acks_from_state()
+                        for fn in self._state_listeners:
+                            try:
+                                fn(data)
+                            except Exception as e:
+                                logger.warning(f"State listener error: {e}")
                     elif "path" in data and "value" in data:
                         path: str = data["path"]
                         value = data["value"]
@@ -386,6 +392,23 @@ class ResolumeAgentClient:
             path = f"/parameter/by-id/{param_id}"
             self._subscriptions.discard(path)
             await self.send_command("unsubscribe", path)
+
+    def add_state_listener(self, fn) -> None:
+        """Register a callback that fires on every full composition state update.
+
+        The callback receives the full state dict. Use this to detect structural
+        changes such as new dashboard bindings (which aren't surfaced as parameter
+        value changes and can't be tracked via monitor_parameter).
+        """
+        if fn not in self._state_listeners:
+            self._state_listeners.append(fn)
+
+    def remove_state_listener(self, fn) -> None:
+        """Unregister a previously added state listener."""
+        try:
+            self._state_listeners.remove(fn)
+        except ValueError:
+            pass
 
     async def reset_parameter(self, param_id: int, reset_animation: bool = False):
         """Reset a parameter to its default value by numeric ID.

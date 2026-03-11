@@ -550,9 +550,13 @@ async def _tool_behaviors(arguments: dict) -> list[TextContent]:
 
     if sub == "list":
         items = mgr.list()
+        # Always show the built-in dashboard naming watcher first
+        dn = mgr.dashboard_naming
+        status = "ON" if dn.enabled else "OFF"
+        lines = [f"[{status}] dashboard_opacity_rename (id=dashboard_naming) [built-in]"]
         if not items:
-            return [TextContent(type="text", text="No behaviors registered.")]
-        lines = []
+            if not lines:
+                return [TextContent(type="text", text="No behaviors registered.")]
         for b in items:
             status = "ON" if b["enabled"] else "OFF"
             fires = b.get("fire_count", 0)
@@ -581,12 +585,18 @@ async def _tool_behaviors(arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
 
     elif sub == "enable":
+        if arguments.get("id") == "dashboard_naming":
+            mgr.dashboard_naming.enable()
+            return [TextContent(type="text", text="Enabled dashboard_opacity_rename")]
         ok = await mgr.enable(arguments["id"])
         if ok:
             return [TextContent(type="text", text=f"Enabled behavior {arguments['id']}")]
         return [TextContent(type="text", text=f"Behavior {arguments['id']} not found")]
 
     elif sub == "disable":
+        if arguments.get("id") == "dashboard_naming":
+            mgr.dashboard_naming.disable()
+            return [TextContent(type="text", text="Disabled dashboard_opacity_rename")]
         ok = await mgr.disable(arguments["id"])
         if ok:
             return [TextContent(type="text", text=f"Disabled behavior {arguments['id']}")]
