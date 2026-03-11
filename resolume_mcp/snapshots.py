@@ -156,11 +156,25 @@ def extract_crossfader(state: dict) -> dict:
     return out
 
 
-def extract_deck(state: dict, deck_index: int) -> dict:
-    """Snapshot a deck's metadata (1-based index).
+def _clip_connected(clip: dict) -> bool:
+    """Return True if a clip slot has content loaded."""
+    cv = clip.get("connected")
+    if isinstance(cv, dict):
+        return bool(cv.get("value", False))
+    if isinstance(cv, bool):
+        return cv
+    # Fallback: treat as connected if it has a non-empty name
+    name = clip.get("name", {})
+    return bool(name.get("value", "") if isinstance(name, dict) else name)
 
-    Captures deck name, color, and the names of clips in each layer/column
-    position. Does NOT capture clip content (that's tied to file paths).
+
+def extract_deck(state: dict, deck_index: int) -> dict:
+    """Snapshot a deck's clip content per layer (1-based index).
+
+    Captures which clip slots are connected (have content loaded) in each
+    layer, along with clip names, file paths, and effects. This snapshot is
+    the input to ``plan_deck_merge`` for safely consolidating clips when
+    merging two decks — preserving every clip without overwrites.
     """
     decks = state.get("decks", [])
     if deck_index < 1 or deck_index > len(decks):
@@ -168,12 +182,116 @@ def extract_deck(state: dict, deck_index: int) -> dict:
     deck = decks[deck_index - 1]
     out: dict[str, Any] = {
         "deck_index": deck_index,
-        "name": deck.get("name", {}).get("value", ""),
+        "deck_name": deck.get("name", {}).get("value", ""),
     }
     colorid = deck.get("colorid")
     if isinstance(colorid, dict) and "value" in colorid:
         out["colorid"] = colorid["value"]
+
+    layers = state.get("layers", [])
+    layer_snapshots = []
+    for i, layer in enumerate(layers):
+        clips = layer.get("clips", [])
+        connected_clips: list[dict[str, Any]] = []
+        for j, clip in enumerate(clips):
+            if not _clip_connected(clip):
+                continue
+            clip_info: dict[str, Any] = {
+                "clip_index": j + 1,
+                "clip_name": clip.get("name", {}).get("value", ""),
+            }
+            video = clip.get("video")
+            if isinstance(video, dict):
+                fileinfo = video.get("fileinfo")
+                if isinstance(fileinfo, dict) and fileinfo.get("path"):
+                    clip_info["file_path"] = fileinfo["path"]
+                effects = video.get("effects", [])
+                if isinstance(effects, list) and effects:
+                    clip_info["effects"] = [_extract_effect(fx) for fx in effects]
+            connected_clips.append(clip_info)
+
+        layer_snapshots.append({
+            "layer_index": i + 1,
+            "layer_name": layer.get("name", {}).get("value", ""),
+            "connected_clips": connected_clips,
+        })
+
+    out["layers"] = layer_snapshots
     return out
+
+
+def plan_deck_merge(source: dict, target: dict) -> dict:
+    """Plan how to merge source deck clips into target without overwrites.
+
+    For each layer, classifies each connected source clip as:
+    - ``direct``: source clip's slot is empty in target → place as-is
+    - ``move``: slot is occupied in target → relocate to next available slot
+    - ``collision``: no empty slot could be found (should not happen in
+      practice; only occurs if the composition is completely full)
+
+    The planner tracks all assigned slots in a single set so direct
+    placements and moves never conflict with each other.
+
+    Returns a merge plan dict; pass it to ``execute_deck_merge`` to apply.
+    """
+    target_by_layer: dict[int, dict] = {
+        l["layer_index"]: l for l in target.get("layers", [])
+    }
+
+    layer_plans = []
+    for snap_layer in source.get("layers", []):
+        layer_index = snap_layer["layer_index"]
+        target_layer = target_by_layer.get(layer_index, {})
+
+        source_clips = snap_layer.get("connected_clips", [])
+        if not source_clips:
+            continue
+
+        # All occupied slots in the target (grows as we assign destinations)
+        all_occupied: set[int] = {
+            c["clip_index"] for c in target_layer.get("connected_clips", [])
+        }
+
+        # Determine search horizon for empty slots
+        source_indices = {c["clip_index"] for c in source_clips}
+        max_search = max(all_occupied | source_indices, default=0) + len(source_clips) + 1
+
+        def next_empty(occupied: set[int], limit: int) -> int | None:
+            for slot in range(1, limit + 1):
+                if slot not in occupied:
+                    return slot
+            return None
+
+        direct: list[dict] = []
+        moves: list[dict] = []
+        collisions: list[dict] = []
+
+        for clip in source_clips:
+            src_idx = clip["clip_index"]
+            if src_idx not in all_occupied:
+                direct.append(clip)
+                all_occupied.add(src_idx)
+            else:
+                dest = next_empty(all_occupied, max_search)
+                if dest is not None:
+                    moves.append({"clip": clip, "to_index": dest})
+                    all_occupied.add(dest)
+                else:
+                    collisions.append(clip)
+
+        layer_plans.append({
+            "layer_index": layer_index,
+            "layer_name": snap_layer["layer_name"],
+            "direct": direct,
+            "moves": moves,
+            "collisions": collisions,
+        })
+
+    return {
+        "source_deck": source.get("deck_name", ""),
+        "target_deck": target.get("deck_name", ""),
+        "layers": layer_plans,
+    }
 
 
 def extract_layer_group(state: dict, group_index: int) -> dict:
@@ -444,6 +562,69 @@ async def restore_layer_group(
     return {"params_set": params_set}
 
 
+async def execute_deck_merge(
+    client: ResolumeAgentClient,
+    plan: dict,
+) -> dict:
+    """Execute a merge plan produced by ``plan_deck_merge`` over WebSocket.
+
+    For each layer:
+    - ``direct`` clips already occupy an empty target slot — no action needed.
+    - ``move`` clips are opened into the destination slot via WebSocket
+      ``post`` + ``/open``, then the source slot is cleared via ``/clear``.
+      Source-based clips without a ``file_path`` are skipped with a note.
+    """
+    import urllib.parse
+
+    layer_results = []
+
+    for layer_plan in plan.get("layers", []):
+        layer_index = layer_plan["layer_index"]
+        layer_name = layer_plan["layer_name"]
+        moved: list[dict] = []
+        skipped: list[dict] = []
+        collisions = layer_plan.get("collisions", [])
+
+        for entry in layer_plan.get("moves", []):
+            clip = entry["clip"]
+            src_idx = clip["clip_index"]
+            dest_idx = entry["to_index"]
+            file_path = clip.get("file_path")
+
+            if not file_path:
+                skipped.append({
+                    "clip": clip["clip_name"],
+                    "from": src_idx,
+                    "to": dest_idx,
+                    "reason": "no file_path (source-based clip — move manually)",
+                })
+                continue
+
+            file_url = "file://" + urllib.parse.quote(file_path, safe="/:")
+            await client.send_command(
+                "post",
+                f"/composition/layers/{layer_index}/clips/{dest_idx}/open",
+                file_url,
+            )
+            await client.send_command(
+                "post",
+                f"/composition/layers/{layer_index}/clips/{src_idx}/clear",
+                None,
+            )
+            moved.append({"clip": clip["clip_name"], "from": src_idx, "to": dest_idx})
+
+        layer_results.append({
+            "layer_index": layer_index,
+            "layer_name": layer_name,
+            "direct_count": len(layer_plan.get("direct", [])),
+            "moved": moved,
+            "skipped": skipped,
+            "collisions": [c["clip_name"] for c in collisions],
+        })
+
+    return {"layers": layer_results}
+
+
 # ---------------------------------------------------------------------------
 # Snapshot store (persistence)
 # ---------------------------------------------------------------------------
@@ -490,13 +671,23 @@ class SnapshotStore:
             try:
                 with open(path) as f:
                     meta = json.load(f)
-                results.append({
+                data = meta.get("data", {})
+                snap_type = meta.get("type", "unknown")
+                entry: dict[str, Any] = {
                     "name": meta.get("name", fname[:-5]),
-                    "type": meta.get("type", "unknown"),
+                    "type": snap_type,
                     "created": meta.get("created", ""),
-                    "layer_name": meta.get("data", {}).get("layer_name", ""),
-                    "layer_index": meta.get("data", {}).get("layer_index", ""),
-                })
+                }
+                if snap_type == "deck":
+                    entry["deck_name"] = data.get("deck_name", "")
+                    entry["deck_index"] = data.get("deck_index", "")
+                    entry["num_clips"] = sum(
+                        len(l.get("connected_clips", [])) for l in data.get("layers", [])
+                    )
+                else:
+                    entry["layer_name"] = data.get("layer_name", "")
+                    entry["layer_index"] = data.get("layer_index", "")
+                results.append(entry)
             except (json.JSONDecodeError, KeyError):
                 continue
         return results

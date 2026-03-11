@@ -27,12 +27,14 @@ from resolume_mcp.client import ResolumeAgentClient
 from resolume_mcp.config import BEHAVIORS_PATH, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT, SNAPSHOTS_DIR
 from resolume_mcp.snapshots import (
     SnapshotStore,
+    execute_deck_merge,
     extract_clip_effects,
     extract_crossfader,
     extract_deck,
     extract_layer_effects,
     extract_layer_group,
     extract_layer_settings,
+    plan_deck_merge,
     restore_clip_effects,
     restore_crossfader,
     restore_layer_effects,
@@ -329,19 +331,29 @@ async def list_tools() -> list[Tool]:
                 "Capture effects, settings, crossfader, decks, layer groups, or clip presets, "
                 "then restore them to the same or different target. "
                 "Snapshots match by name (not ID), so they work across compositions. "
-                "Subcommands: save, load, list, delete, show."
+                "Use 'merge' to safely consolidate clips from two deck snapshots — "
+                "colliding clips are relocated to the next empty slot per layer. "
+                "Subcommands: save, load, merge, list, delete, show."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "subcommand": {
                         "type": "string",
-                        "enum": ["save", "load", "list", "delete", "show"],
+                        "enum": ["save", "load", "merge", "list", "delete", "show"],
                         "description": "Operation to perform",
                     },
                     "name": {
                         "type": "string",
                         "description": "Snapshot name (for save/load/delete/show)",
+                    },
+                    "source_name": {
+                        "type": "string",
+                        "description": "Source deck snapshot name (for merge)",
+                    },
+                    "target_name": {
+                        "type": "string",
+                        "description": "Target deck snapshot name (for merge)",
                     },
                     "snapshot_type": {
                         "type": "string",
@@ -366,6 +378,10 @@ async def list_tools() -> list[Tool]:
                     "group_index": {
                         "type": "integer",
                         "description": "1-based layer group index (for layer_group)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, show the merge plan without executing (for merge)",
                     },
                 },
                 "required": ["subcommand"],
@@ -589,9 +605,11 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="No snapshots saved.")]
         lines = []
         for s in items:
-            lines.append(
-                f"{s['name']} ({s['type']}) — {s.get('layer_name', '')} L{s.get('layer_index', '?')} [{s['created']}]"
-            )
+            if s["type"] == "deck":
+                detail = f"deck {s.get('deck_name', '?')!r} ({s.get('num_clips', '?')} clips)"
+            else:
+                detail = f"{s.get('layer_name', '')} L{s.get('layer_index', '?')}"
+            lines.append(f"{s['name']} ({s['type']}) — {detail} [{s['created']}]")
         return [TextContent(type="text", text="\n".join(lines))]
 
     elif sub == "save":
@@ -631,11 +649,16 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
 
         _snapshot_store.save(name, snap_type, data)
         summary = f"Saved snapshot {name!r} ({snap_type})"
-        if "effects" in data:
-            n_fx = len(data["effects"])
-            summary += f" — {n_fx} effects"
-        if data.get("layer_name"):
-            summary += f" from {data['layer_name']!r}"
+        if snap_type == "deck":
+            n_connected = sum(
+                len(l.get("connected_clips", [])) for l in data.get("layers", [])
+            )
+            summary += f" — {data.get('deck_name', '')!r}, {n_connected} connected clips"
+        else:
+            if "effects" in data:
+                summary += f" — {len(data['effects'])} effects"
+            if data.get("layer_name"):
+                summary += f" from {data['layer_name']!r}"
         return [TextContent(type="text", text=summary)]
 
     elif sub == "load":
@@ -710,11 +733,64 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
         elif snap_type == "deck":
             return [TextContent(
                 type="text",
-                text=f"Deck snapshots are read-only references (name/color). Use 'show' to view.",
+                text=(
+                    f"Deck snapshot {name!r} contains clip content — use subcommand "
+                    f"'merge' with source_name and target_name to consolidate clips."
+                ),
             )]
 
         else:
             return [TextContent(type="text", text=f"Unknown snapshot type: {snap_type}")]
+
+    elif sub == "merge":
+        source_name = arguments.get("source_name")
+        target_name = arguments.get("target_name")
+        if not source_name or not target_name:
+            return [TextContent(type="text", text="Error: 'source_name' and 'target_name' are required for merge")]
+
+        source_snap = _snapshot_store.load(source_name)
+        target_snap = _snapshot_store.load(target_name)
+        if source_snap is None:
+            return [TextContent(type="text", text=f"Snapshot {source_name!r} not found")]
+        if target_snap is None:
+            return [TextContent(type="text", text=f"Snapshot {target_name!r} not found")]
+        if source_snap.get("type") != "deck" or target_snap.get("type") != "deck":
+            return [TextContent(type="text", text="Error: both snapshots must be of type 'deck'")]
+
+        plan = plan_deck_merge(source_snap["data"], target_snap["data"])
+
+        if arguments.get("dry_run"):
+            lines = [
+                f"Merge plan: {source_name!r} → {target_name!r}",
+                f"Source deck: {plan['source_deck']}  Target deck: {plan['target_deck']}",
+            ]
+            for lp in plan["layers"]:
+                lines.append(f"\n  Layer {lp['layer_index']} {lp['layer_name']!r}:")
+                if lp["direct"]:
+                    names = [c["clip_name"] or f"C{c['clip_index']}" for c in lp["direct"]]
+                    lines.append(f"    direct (no conflict): {names}")
+                for m in lp["moves"]:
+                    c = m["clip"]
+                    label = c["clip_name"] or f"C{c['clip_index']}"
+                    lines.append(f"    move: {label!r} → slot {m['to_index']}")
+                if lp["collisions"]:
+                    lines.append(f"    UNRESOLVABLE: {[c['clip_name'] for c in lp['collisions']]}")
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        client = await get_client()
+        result = await execute_deck_merge(client, plan)
+
+        lines = [f"Merged {source_name!r} → {target_name!r}:"]
+        for lr in result["layers"]:
+            lines.append(f"  Layer {lr['layer_index']} {lr['layer_name']!r}:")
+            lines.append(f"    direct (already in place): {lr['direct_count']}")
+            for m in lr["moved"]:
+                lines.append(f"    moved: {m['clip']!r} C{m['from']} → C{m['to']}")
+            for s in lr["skipped"]:
+                lines.append(f"    skipped: {s['clip']!r} ({s['reason']})")
+            if lr["collisions"]:
+                lines.append(f"    unresolvable: {', '.join(lr['collisions'])}")
+        return [TextContent(type="text", text="\n".join(lines))]
 
     elif sub == "show":
         name = arguments.get("name")
@@ -727,31 +803,49 @@ async def _tool_snapshots(arguments: dict) -> list[TextContent]:
         snap_type = snap.get("type", "")
         lines = [f"Snapshot: {name} ({snap_type})", f"Created: {snap.get('created', '')}"]
 
-        if data.get("layer_name"):
-            lines.append(f"Layer: {data['layer_name']} (index {data.get('layer_index', '?')})")
-        if data.get("clip_name"):
-            lines.append(f"Clip: {data['clip_name']} (index {data.get('clip_index', '?')})")
+        if snap_type == "deck":
+            lines.append(f"Deck: {data.get('deck_name', '')} (index {data.get('deck_index', '?')})")
+            if "colorid" in data:
+                lines.append(f"  colorid: {data['colorid']}")
+            for snap_layer in data.get("layers", []):
+                clips = snap_layer.get("connected_clips", [])
+                lines.append(
+                    f"  L{snap_layer['layer_index']} {snap_layer['layer_name']!r}: "
+                    f"{len(clips)} connected clips"
+                )
+                for c in clips:
+                    n_fx = len(c.get("effects", []))
+                    has_file = "file" if c.get("file_path") else "source"
+                    lines.append(
+                        f"    C{c['clip_index']} {c['clip_name']!r} [{has_file}]"
+                        + (f", {n_fx} effects" if n_fx else "")
+                    )
+        else:
+            if data.get("layer_name"):
+                lines.append(f"Layer: {data['layer_name']} (index {data.get('layer_index', '?')})")
+            if data.get("clip_name"):
+                lines.append(f"Clip: {data['clip_name']} (index {data.get('clip_index', '?')})")
 
-        if "effects" in data:
-            lines.append(f"Effects ({len(data['effects'])}):")
-            for fx in data["effects"]:
-                bp = f", bypassed={fx['bypassed']}" if "bypassed" in fx else ""
-                n_params = len(fx.get("params", {}))
-                lines.append(f"  {fx['name']}{bp}, {n_params} params")
+            if "effects" in data:
+                lines.append(f"Effects ({len(data['effects'])}):")
+                for fx in data["effects"]:
+                    bp = f", bypassed={fx['bypassed']}" if "bypassed" in fx else ""
+                    n_params = len(fx.get("params", {}))
+                    lines.append(f"  {fx['name']}{bp}, {n_params} params")
 
-        for key in ("bypassed", "solo", "master", "video_opacity", "crossfadergroup",
-                     "maskmode", "ignorecolumntrigger", "faderstart", "phase",
-                     "behaviour", "curve", "colorid", "name"):
-            if key in data and key != "name" or (key == "name" and snap_type == "deck"):
-                lines.append(f"  {key}: {data[key]}")
+            for key in ("bypassed", "solo", "master", "video_opacity", "crossfadergroup",
+                         "maskmode", "ignorecolumntrigger", "faderstart", "phase",
+                         "behaviour", "curve", "colorid"):
+                if key in data:
+                    lines.append(f"  {key}: {data[key]}")
 
-        if "mixer" in data:
-            lines.append("  mixer:")
-            for pname, pval in data["mixer"].items():
-                lines.append(f"    {pname}: {pval.get('value', '?')}")
+            if "mixer" in data:
+                lines.append("  mixer:")
+                for pname, pval in data["mixer"].items():
+                    lines.append(f"    {pname}: {pval.get('value', '?')}")
 
-        if "layer_names" in data:
-            lines.append(f"  layers: {', '.join(data['layer_names'])}")
+            if "layer_names" in data:
+                lines.append(f"  layers: {', '.join(data['layer_names'])}")
 
         return [TextContent(type="text", text="\n".join(lines))]
 
